@@ -2329,8 +2329,16 @@ export function createNotificationsExtension(
 		if (isTelegramConfigured(cfg)) {
 			if ((await ensureTelegramOwner(settings, cwd, id)) === "blocked_identity") return false;
 		}
-		if (isDiscordConfigured(cfg)) await ensureDiscordDaemon(settings);
-		if (isSlackConfigured(cfg)) await ensureSlackDaemon(settings);
+		if (isDiscordConfigured(cfg)) {
+			void ensureDiscordDaemon(settings).catch(error =>
+				logger.warn(`sdk: Discord daemon did not become ready during session startup: ${String(error)}`),
+			);
+		}
+		if (isSlackConfigured(cfg)) {
+			void ensureSlackDaemon(settings).catch(error =>
+				logger.warn(`sdk: Slack daemon did not become ready during session startup: ${String(error)}`),
+			);
+		}
 		return true;
 	}
 	const identityControlOperations = new Set([

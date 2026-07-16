@@ -158,11 +158,10 @@ export async function runChatDaemonInternal(
 	if (!ownerId) throw new Error("missing --owner-id");
 	const pid = ownerPid(ownerId);
 	if (pid !== undefined && !(deps.pidAlive ?? defaultPidAlive)(pid)) return;
+	const daemonPid = deps.processPid ?? process.pid;
 	const config = await loadConfig(agentDir, kind);
 	if (!config) return;
-	if (
-		!(await acquireChatDaemonOwnership({ agentDir, kind, ownerId, pid: deps.processPid, identity: config.identity }))
-	)
+	if (!(await acquireChatDaemonOwnership({ agentDir, kind, ownerId, pid: daemonPid, identity: config.identity })))
 		return;
 
 	let incarnation: string | undefined;
@@ -181,7 +180,7 @@ export async function runChatDaemonInternal(
 				agentDir,
 				kind,
 				ownerId,
-				pid: deps.processPid,
+				pid: daemonPid,
 				incarnation,
 				transportHealthy: runtime?.transportHealthy?.() ?? true,
 			});
@@ -208,7 +207,8 @@ export async function runChatDaemonInternal(
 		try {
 			await runtime?.stop();
 		} finally {
-			await releaseChatDaemonOwnership({ agentDir, kind, ownerId, pid: deps.processPid, incarnation });
+			if (incarnation !== undefined)
+				await releaseChatDaemonOwnership({ agentDir, kind, ownerId, pid: daemonPid, incarnation });
 		}
 	}
 }

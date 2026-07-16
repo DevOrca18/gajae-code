@@ -26,7 +26,7 @@ import {
 	tokenFingerprint,
 } from "../src/sdk/bus/config";
 import { createNotificationsExtension } from "../src/sdk/bus/index";
-import { daemonPaths, ensureTelegramDaemonRunning } from "../src/sdk/bus/telegram-daemon";
+import { daemonPaths, ensureTelegramDaemonRunning, renewDaemonHeartbeat } from "../src/sdk/bus/telegram-daemon";
 import { createLightweightDaemonSettings } from "../src/sdk/bus/telegram-daemon-cli";
 import { SessionManager } from "../src/session/session-manager";
 import { cleanupFixtureRoot } from "./helpers/fixture-broker-cleanup";
@@ -955,15 +955,31 @@ describe("notifications config", () => {
 
 		createNotificationsExtension(api, {
 			settings,
-			ensureTelegramDaemon: input =>
-				ensureTelegramDaemonRunning(input, {
+			ensureTelegramDaemon: input => {
+				let ownerId: string | undefined;
+				return ensureTelegramDaemonRunning(input, {
 					pid: 4242,
-					pidAlive: () => true,
-					spawn: () => {
+					pidAlive: pid => pid === 4242 || pid === 4243,
+					pidIncarnation: () => "stable",
+					spawn: (_command, args) => {
+						ownerId = args[args.indexOf("--owner-id") + 1];
 						spawns++;
-						return { unref() {} };
+						return { pid: 4243, unref() {} };
 					},
-				}),
+					sleep: async () => {
+						if (!ownerId) throw new Error("Telegram daemon spawn did not provide an owner ID");
+						await renewDaemonHeartbeat({
+							settings,
+							ownerId,
+							acquisitionId: ownerId,
+							pid: 4243,
+							pidIncarnation: () => "stable",
+						});
+					},
+					waitStepMs: 1,
+					readinessTimeoutMs: 100,
+				});
+			},
 		});
 
 		const endpoint = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);

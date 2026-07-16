@@ -7,8 +7,8 @@
 export const NOTIFICATION_PROTOCOL_VERSION = 3;
 
 /**
- * Operational generation the current daemon build speaks. It is tied to the
- * wire protocol version so a freshly-upgraded host can identify an older,
- * still-live daemon without coupling status readers to the daemon runtime.
+ * Operational generation of the daemon lifecycle and ownership contract.
+ * This intentionally changes only when daemon behavior or lifecycle semantics
+ * require replacement; it is independent from the notification wire protocol.
  */
-export const DAEMON_GENERATION = NOTIFICATION_PROTOCOL_VERSION;
+export const DAEMON_GENERATION = 4;

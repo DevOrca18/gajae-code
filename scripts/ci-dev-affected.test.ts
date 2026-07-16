@@ -48,8 +48,8 @@ describe("planTasks command shape (issue #622)", () => {
 describe("dev-ci canonical-plan workflow contract", () => {
 	test("binds the canonical plan to its checked-out source and validates it before aggregate decisions", async () => {
 		const workflow = await Bun.file(path.join(import.meta.dir, "..", ".github", "workflows", "dev-ci.yml")).text();
-		expect(workflow.match(/ref: \$\{\{ github\.event\.pull_request\.head\.sha \|\| github\.sha \}\}/g)).toHaveLength(5);
-		expect(workflow.match(/Verify checked-out source head/g)).toHaveLength(5);
+		expect(workflow.match(/ref: \$\{\{ github\.event\.pull_request\.head\.sha \|\| github\.sha \}\}/g)).toHaveLength(7);
+		expect(workflow.match(/Verify checked-out source head/g)).toHaveLength(6);
 		expect(workflow).toContain("name: dev-affected-plan-${{ github.run_id }}-${{ github.run_attempt }}");
 		expect(workflow.match(/\$\{\{ github\.run_id \}\}-\$\{\{ github\.run_attempt \}\}/g)).toHaveLength(8);
 		expect(workflow).toContain("include-hidden-files: true");
@@ -67,6 +67,10 @@ describe("dev-ci canonical-plan workflow contract", () => {
 		expect(workflow).toContain("--validate-aggregate");
 		expect(workflow).toContain("CI_DEV_WINDOWS_DOCTOR_RESULT: ${{ needs.windows-dev-doctor.result }}");
 		expect(workflow).toContain("CI_DEV_WINDOWS_DOCTOR_REQUIRED: ${{ contains(needs.affected-plan.outputs.changed_paths, 'scripts/dev-link') }}");
+		expect(workflow).toContain("CI_DEV_TELEGRAM_GUARD_RESULT: ${{ needs.telegram-daemon-generation.result }}");
+		expect(workflow).toContain("CI_DEV_TELEGRAM_GUARD_REQUIRED: ${{ needs.affected-plan.outputs.relevant }}");
+		expect(workflow).toContain("CI_DEV_TELEGRAM_WINDOWS_RESULT: ${{ needs.windows-telegram-daemon-safety.result }}");
+		expect(workflow).toContain("CI_DEV_TELEGRAM_WINDOWS_REQUIRED:");
 		expect(workflow).toContain("max-parallel: 8");
 		expect(workflow).toContain("CI_DEV_MATRIX_IDENTITY: ${{ matrix.identity }}");
 		expect(workflow).toContain("Upload shard completion receipt");
@@ -77,16 +81,64 @@ describe("dev-ci canonical-plan workflow contract", () => {
 		expect(workflow).not.toContain("native-cache");
 		expect(workflow).not.toContain("pull_request_target");
 		expect(workflow).not.toContain("uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830");
-		expect(workflow.match(/uses: actions\/cache\/restore@0057852bfaa89a56745cba8c7296529d2fc39830/g)).toHaveLength(4);
+		expect(workflow.match(/uses: actions\/cache\/restore@0057852bfaa89a56745cba8c7296529d2fc39830/g)).toHaveLength(6);
 		expect(workflow.match(/save-if: \$\{\{ github\.event_name == 'push' && github\.ref == 'refs\/heads\/dev' \}\}/g)).toHaveLength(3);
 	});
 
 	test("aggregate result truth table rejects every missing, failed, cancelled, and unplanned dependency", () => {
 		const valid: AffectedAggregateResults[] = [
-			{ plan: "success", native: "success", shards: "success", windowsDoctor: "success", windowsDoctorRequired: "true", hasNative: "true", hasTasks: "true" },
-			{ plan: "success", native: "skipped", shards: "skipped", windowsDoctor: "skipped", windowsDoctorRequired: "false", hasNative: "false", hasTasks: "false" },
-			{ plan: "success", native: "success", shards: "skipped", windowsDoctor: "skipped", windowsDoctorRequired: "false", hasNative: "true", hasTasks: "false" },
-			{ plan: "success", native: "skipped", shards: "success", windowsDoctor: "success", windowsDoctorRequired: "true", hasNative: "false", hasTasks: "true" },
+			{
+				plan: "success",
+				native: "success",
+				shards: "success",
+				windowsDoctor: "success",
+				windowsDoctorRequired: "true",
+				telegramGuard: "success",
+				telegramGuardRequired: "true",
+				telegramWindows: "success",
+				telegramWindowsRequired: "true",
+				hasNative: "true",
+				hasTasks: "true",
+			},
+			{
+				plan: "success",
+				native: "skipped",
+				shards: "skipped",
+				windowsDoctor: "skipped",
+				windowsDoctorRequired: "false",
+				telegramGuard: "skipped",
+				telegramGuardRequired: "false",
+				telegramWindows: "skipped",
+				telegramWindowsRequired: "false",
+				hasNative: "false",
+				hasTasks: "false",
+			},
+			{
+				plan: "success",
+				native: "success",
+				shards: "skipped",
+				windowsDoctor: "skipped",
+				windowsDoctorRequired: "false",
+				telegramGuard: "success",
+				telegramGuardRequired: "true",
+				telegramWindows: "success",
+				telegramWindowsRequired: "true",
+				hasNative: "true",
+				hasTasks: "false",
+			},
+			{
+				plan: "success",
+				native: "skipped",
+				shards: "success",
+				windowsDoctor: "success",
+				windowsDoctorRequired: "true",
+				telegramGuard: "success",
+				telegramGuardRequired: "true",
+				telegramWindows: "success",
+				telegramWindowsRequired: "true",
+				hasNative: "false",
+				hasTasks: "true",
+			},
 		];
 		for (const results of valid) expect(() => validateAffectedAggregate(results)).not.toThrow();
 
@@ -100,14 +152,27 @@ describe("dev-ci canonical-plan workflow contract", () => {
 			{ ...valid[0]!, windowsDoctor: "failure" },
 			{ ...valid[0]!, windowsDoctor: "cancelled" },
 			{ ...valid[0]!, windowsDoctor: "skipped" },
+			{ ...valid[0]!, telegramGuard: "failure" },
+			{ ...valid[0]!, telegramGuard: "cancelled" },
+			{ ...valid[0]!, telegramGuard: "skipped" },
+			{ ...valid[0]!, telegramWindows: "failure" },
+			{ ...valid[0]!, telegramWindows: "cancelled" },
+			{ ...valid[0]!, telegramWindows: "skipped" },
 			{ ...valid[1]!, windowsDoctor: "success" },
+			{ ...valid[1]!, telegramGuard: "success" },
+			{ ...valid[1]!, telegramWindows: "success" },
 			{ ...valid[1]!, windowsDoctorRequired: "" },
 			{ ...valid[1]!, windowsDoctorRequired: "maybe" },
+			{ ...valid[1]!, telegramGuardRequired: "" },
+			{ ...valid[1]!, telegramGuardRequired: "maybe" },
+			{ ...valid[1]!, telegramWindowsRequired: "" },
+			{ ...valid[1]!, telegramWindowsRequired: "maybe" },
 			{ ...valid[1]!, hasNative: "" },
 			{ ...valid[1]!, hasTasks: "maybe" },
 			{ ...valid[1]!, native: "success" },
 			{ ...valid[1]!, shards: "success" },
-		]) expect(() => validateAffectedAggregate(results)).toThrow();
+		])
+			expect(() => validateAffectedAggregate(results)).toThrow();
 	});
 });
 
@@ -242,6 +307,18 @@ describe("describeTasks matrix emission", () => {
 		];
 		for (const key of ["ci-selftest", "ci-dry-run", "affected-selftest", "affected-dry-run"]) {
 			expect(entries.find(entry => entry.key === key)).toMatchObject({ rust: true, nextest: false });
+		}
+	});
+
+	test("push affected selftest runs selector and topology coverage for workflow and topology changes", () => {
+		for (const changedPath of [".github/workflows/dev-ci.yml", "scripts/dev-ci-guard-topology.test.ts"]) {
+			const task = planTasks([changedPath], packages).find(candidate => candidate.key === "affected-selftest");
+			expect(task?.command).toEqual([
+				"bun",
+				"test",
+				"scripts/ci-dev-affected.test.ts",
+				"scripts/dev-ci-guard-topology.test.ts",
+			]);
 		}
 	});
 
@@ -675,6 +752,17 @@ describe("planTargetedTasks PR-mode targeting", () => {
 	test("a CI harness script change plans ci-selftest + ci-dry-run (no yaml-parse)", () => {
 		const tasks = targeted(["scripts/ci-dev-affected.ts"]);
 		expect(tasks.map(task => task.key).sort()).toEqual(["ci-dry-run", "ci-selftest"]);
+	});
+
+	test("the dev CI guard topology test is scheduled and executed as a CI harness change", () => {
+		const tasks = targeted(["scripts/dev-ci-guard-topology.test.ts"]);
+		expect(tasks.map(task => task.key).sort()).toEqual(["ci-dry-run", "ci-selftest"]);
+		expect(tasks.find(task => task.key === "ci-selftest")?.command).toEqual([
+			"bun",
+			"test",
+			"scripts/ci-dev-affected.test.ts",
+			"scripts/dev-ci-guard-topology.test.ts",
+		]);
 	});
 
 	test("native platform package changes plan release publish validation", () => {

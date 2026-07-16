@@ -6,6 +6,19 @@ on:
   pull_request:
     branches: [dev]
   workflow_dispatch:
+    inputs:
+      base_ref:
+        description: Base branch ref whose tip must equal base_sha.
+        required: true
+        type: string
+      base_sha:
+        description: Exact 40-hex base commit SHA to compare against base_ref.
+        required: true
+        type: string
+      base_repository:
+        description: Base owner/repository containing base_ref (must be this repository).
+        required: true
+        type: string
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -31,7 +44,7 @@ jobs:
       plan_source_sha: ${{ steps.plan.outputs.plan_source_sha }}
     env:
       GITHUB_EVENT_BEFORE: ${{ github.event.before }}
-      GITHUB_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+      GITHUB_BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event_name == 'workflow_dispatch' && inputs.base_sha || github.event.before }}
       CI_DEV_SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
@@ -64,6 +77,96 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+
+  telegram-daemon-generation:
+    name: Telegram daemon generation guard
+    needs: [affected-plan]
+    if: ${{ needs.affected-plan.outputs.relevant == 'true' }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    env:
+      GITHUB_BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event_name == 'workflow_dispatch' && inputs.base_sha || github.event.before }}
+      GITHUB_HEAD_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+      BASE_REF: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.ref || github.event_name == 'workflow_dispatch' && inputs.base_ref || github.ref_name }}
+      HEAD_REF: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.ref || github.ref_name }}
+      BASE_REPOSITORY: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.repo.full_name || github.event_name == 'workflow_dispatch' && inputs.base_repository || github.repository }}
+      HEAD_REPOSITORY: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name || github.repository }}
+      GUARD_EVENT_NAME: ${{ github.event_name }}
+      GUARD_REPOSITORY: ${{ github.repository }}
+    steps:
+      - name: Validate exact guard inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha='^[0-9a-fA-F]{40}$'
+          repo='^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$'
+          [[ "${GITHUB_BASE_SHA}" =~ ${sha} ]] || { echo "Guard base SHA must be an exact 40-hex commit"; exit 1; }
+          [[ "${GITHUB_HEAD_SHA}" =~ ${sha} ]] || { echo "Guard head SHA must be an exact 40-hex commit"; exit 1; }
+          [[ "${BASE_REPOSITORY}" =~ ${repo} ]] || { echo "Guard base repository is invalid"; exit 1; }
+          [[ "${HEAD_REPOSITORY}" =~ ${repo} ]] || { echo "Guard head repository is invalid"; exit 1; }
+          [[ "${GUARD_REPOSITORY}" =~ ${repo} ]] || { echo "Guard repository is invalid"; exit 1; }
+          git check-ref-format --branch "${BASE_REF}" >/dev/null || { echo "Guard base ref is not a valid branch ref"; exit 1; }
+          git check-ref-format --branch "${HEAD_REF}" >/dev/null || { echo "Guard head ref is not a valid branch ref"; exit 1; }
+          case "${GUARD_EVENT_NAME}" in
+            pull_request) [[ "${BASE_REPOSITORY}" == "${GUARD_REPOSITORY}" ]] || { echo "PR base repository must be this repository"; exit 1; } ;;
+            push|workflow_dispatch) [[ "${BASE_REPOSITORY}" == "${GUARD_REPOSITORY}" && "${HEAD_REPOSITORY}" == "${GUARD_REPOSITORY}" ]] || { echo "Push and dispatch repositories must be this repository"; exit 1; } ;;
+            *) echo "Unsupported guard event"; exit 1 ;;
+          esac
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          repository: ${{ env.HEAD_REPOSITORY }}
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+      - name: Verify checked-out source head
+        shell: bash
+        run: |
+          set -euo pipefail
+          head="$(git rev-parse HEAD)"
+          [[ "${head}" == "${GITHUB_HEAD_SHA}" ]] || { echo "Checked-out SHA ${head} does not match ${GITHUB_HEAD_SHA}"; exit 1; }
+      - name: Fetch and prove authoritative guard revisions
+        shell: bash
+        run: |
+          set -euo pipefail
+          git remote add guard-head "https://github.com/${HEAD_REPOSITORY}.git"
+          git remote add guard-base "https://github.com/${BASE_REPOSITORY}.git"
+          git fetch --no-tags guard-head "refs/heads/${HEAD_REF}:refs/remotes/guard-head/${HEAD_REF}"
+          base_ref_sha=''
+          case "${GUARD_EVENT_NAME}" in
+            pull_request)
+              # The immutable event base object remains authoritative while a queued
+              # pull request's live base branch advances.
+              git fetch --no-tags guard-base "${GITHUB_BASE_SHA}"
+              ;;
+            workflow_dispatch)
+              git fetch --no-tags guard-base "refs/heads/${BASE_REF}:refs/remotes/guard-base/${BASE_REF}"
+              base_ref_sha="$(git rev-parse --verify "refs/remotes/guard-base/${BASE_REF}^{commit}")"
+              [[ "${base_ref_sha}" == "${GITHUB_BASE_SHA}" ]] || { echo "Dispatch base ref ${BASE_REF} resolves to ${base_ref_sha}, not ${GITHUB_BASE_SHA}"; exit 1; }
+              ;;
+            push)
+              git fetch --no-tags guard-base "${GITHUB_BASE_SHA}"
+              ;;
+          esac
+          {
+            echo "GUARD_CHECKED_OUT_HEAD=$(git rev-parse --verify HEAD^{commit})"
+            echo "GUARD_HEAD_REF_SHA=$(git rev-parse --verify "refs/remotes/guard-head/${HEAD_REF}^{commit}")"
+            echo "GUARD_BASE_OBJECT_SHA=$(git rev-parse --verify "${GITHUB_BASE_SHA}^{commit}")"
+            echo "GUARD_BASE_REF_SHA=${base_ref_sha}"
+          } >> "${GITHUB_ENV}"
+          printf 'guard evidence: base %s@%s; head %s@%s\n' "${BASE_REPOSITORY}" "${GITHUB_BASE_SHA}" "${HEAD_REPOSITORY}" "${HEAD_REF}"
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
+        with:
+          bun-version: "1.3"
+      - name: Cache bun dependencies
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
+        with:
+          path: ~/.bun/install/cache
+          key: bun-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
+      # The guard's AST canonicalization is parser-version sensitive: install the
+      # pinned @babel/parser from the lockfile so the current-tree digest check is
+      # deterministic and matches the committed attestations (no auto-install drift).
+      - run: bun install --frozen-lockfile
+      - run: bun scripts/telegram-daemon-generation-guard.ts --check-authority
+      - run: bun scripts/telegram-daemon-generation-guard.ts
   windows-dev-doctor:
     name: Windows dev:doctor
     needs: [affected-plan]
@@ -118,9 +221,58 @@ jobs:
           bun run dev:doctor
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-  # Native addon build runs once per run and publishes the built `.node` files as
-  # an artifact the runtime-dependent shards download. It is skipped when the
-  # plan needs no native build at all.
+  windows-telegram-daemon-safety:
+    name: Windows Telegram daemon safety
+    needs: [affected-plan]
+    if: ${{ needs.affected-plan.outputs.relevant == 'true' && (contains(needs.affected-plan.outputs.changed_paths, 'telegram-daemon') || contains(needs.affected-plan.outputs.changed_paths, 'chat-daemon-control.ts') || contains(needs.affected-plan.outputs.changed_paths, 'daemon-control.test.ts') || contains(needs.affected-plan.outputs.changed_paths, 'notifications-telegram-daemon.test.ts') || contains(needs.affected-plan.outputs.changed_paths, 'chat-daemon')) }}
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
+        with:
+          bun-version: "1.3"
+      - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2  # nightly
+        with:
+          toolchain: nightly-2026-04-29
+      - name: Prepend rustup toolchain bin to PATH
+        shell: bash
+        run: |
+          toolchain_bin="$(dirname "$(rustup which cargo)")"
+          echo "$toolchain_bin" >> "$GITHUB_PATH"
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
+        with:
+          shared-key: windows-telegram-daemon-safety-win32-x64
+          cache-on-failure: true
+          cache-workspace-crates: true
+      - name: Cache bun dependencies
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
+        with:
+          path: ~/.bun/install/cache
+          key: bun-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
+      - run: bun install --frozen-lockfile
+      - name: Build native addon (win32-x64 baseline)
+        env:
+          TARGET_PLATFORM: win32
+          TARGET_ARCH: x64
+          TARGET_VARIANTS: baseline
+        run: bun run ci:build:native
+      - name: Run Windows daemon provenance safety contract
+        shell: pwsh
+        run: |
+          bun test packages/coding-agent/test/daemon-control.test.ts --test-name-pattern 'incarnation|captured-owner|owner-lock|poll overlap|configured chat providers'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          bun test packages/coding-agent/test/notifications-telegram-daemon.test.ts --test-name-pattern 'concurrent ensureTelegramDaemonRunning|stale dead-pid lock|lock written before|parent-format|transition lock|provisional|readiness|reload failure|pre-upgrade owner|current-generation live owner|rollback preserves legacy unmanaged root|runDaemonInternal rewrites persisted owner pid|heartbeat fails closed'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+  # Native addon build runs at most once per run and publishes the built `.node`
+  # files as an artifact the runtime-dependent shards download. A content-hash
+  # cache of the native sources lets PRs that don't touch crates/natives restore
+  # the prebuilt addon and skip the Rust/native source build entirely; only a
+  # cache miss (native source actually changed) recompiles. Skipped when the plan
+  # needs no native build at all.
   affected-native:
     name: Affected path validation / native-build
     needs: [affected-plan]
@@ -275,7 +427,7 @@ jobs:
         env:
           AFFECTED_TASK_KEY: ${{ matrix.key }}
           GITHUB_EVENT_BEFORE: ${{ github.event.before }}
-          GITHUB_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          GITHUB_BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event_name == 'workflow_dispatch' && inputs.base_sha || github.event.before }}
         run: bun scripts/ci-dev-affected.ts --task="$AFFECTED_TASK_KEY"
       - name: Write shard completion receipt
         run: |
@@ -294,12 +446,13 @@ jobs:
 
   # Branch protection must keep requiring this stable aggregate status. It validates
   # the canonical plan and receipts, then passes iff the planner, native build,
-  # every affected shard, and Windows doctor satisfy their planned contracts. The
-  # job name must stay exactly "Affected path validation".
+  # every affected shard, Windows doctor, Telegram generation guard, and required
+  # Windows daemon safety lane satisfy their planned contracts. The job name must
+  # stay exactly "Affected path validation".
   affected:
     name: Affected path validation
     if: ${{ always() }}
-    needs: [affected-plan, affected-native, affected-shards, windows-dev-doctor]
+    needs: [affected-plan, affected-native, affected-shards, telegram-daemon-generation, windows-dev-doctor, windows-telegram-daemon-safety]
     runs-on: ubuntu-22.04
     timeout-minutes: 5
     env:
@@ -346,6 +499,10 @@ jobs:
           CI_DEV_HAS_TASKS: ${{ needs.affected-plan.outputs.has_tasks }}
           CI_DEV_WINDOWS_DOCTOR_RESULT: ${{ needs.windows-dev-doctor.result }}
           CI_DEV_WINDOWS_DOCTOR_REQUIRED: ${{ contains(needs.affected-plan.outputs.changed_paths, 'scripts/dev-link') }}
+          CI_DEV_TELEGRAM_GUARD_RESULT: ${{ needs.telegram-daemon-generation.result }}
+          CI_DEV_TELEGRAM_GUARD_REQUIRED: ${{ needs.affected-plan.outputs.relevant }}
+          CI_DEV_TELEGRAM_WINDOWS_RESULT: ${{ needs.windows-telegram-daemon-safety.result }}
+          CI_DEV_TELEGRAM_WINDOWS_REQUIRED: ${{ contains(needs.affected-plan.outputs.changed_paths, 'telegram-daemon') || contains(needs.affected-plan.outputs.changed_paths, 'chat-daemon-control.ts') || contains(needs.affected-plan.outputs.changed_paths, 'daemon-control.test.ts') || contains(needs.affected-plan.outputs.changed_paths, 'notifications-telegram-daemon.test.ts') || contains(needs.affected-plan.outputs.changed_paths, 'chat-daemon') }}
         run: bun scripts/ci-dev-affected.ts --validate-aggregate
 
   gjc-state-gates-matrix:
@@ -358,7 +515,7 @@ jobs:
         group: [static, runtime, integrity, read]
     env:
       GITHUB_EVENT_BEFORE: ${{ github.event.before }}
-      GITHUB_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+      GITHUB_BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event_name == 'workflow_dispatch' && inputs.base_sha || github.event.before }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
         with:

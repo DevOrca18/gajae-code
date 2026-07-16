@@ -10,9 +10,11 @@
  * artifacts belonging to a DEAD owner (dead-PID / explicitly-stale). It never
  * touches a live owner's lock/state and never kills a process.
  */
+import type { WriteFileOptions } from "node:fs";
 import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
 import type { Settings } from "../../config/settings";
+import { processIncarnation } from "../broker/process-incarnation";
 import {
 	getNotificationConfig,
 	isDiscordConfigured,
@@ -58,6 +60,8 @@ export interface NotificationServiceFs {
 	 * recovery and a concurrent daemon takeover are mutually exclusive.
 	 */
 	createExclusive(file: string): Promise<boolean>;
+	writeFile?(file: string, data: string, opts?: WriteFileOptions): Promise<void>;
+	stat?(file: string): Promise<{ mtimeMs: number }>;
 }
 
 const nodeServiceFs: NotificationServiceFs = {
@@ -73,6 +77,8 @@ const nodeServiceFs: NotificationServiceFs = {
 			return false;
 		}
 	},
+	writeFile: (file, data, opts) => fsPromises.writeFile(file, data, opts),
+	stat: file => fsPromises.stat(file),
 };
 
 /** Injectable dependencies shared across service operations. */
@@ -647,6 +653,97 @@ export interface RecoveryOptions {
 	deps?: NotificationServiceDeps;
 }
 
+const TRANSITION_LOCK_STALE_MS = HEARTBEAT_TTL_MS;
+
+interface DaemonTransitionLock {
+	pid: number;
+	incarnation: string;
+	createdAt: number;
+}
+
+function isDaemonTransitionLock(value: unknown): value is DaemonTransitionLock {
+	if (!value || typeof value !== "object") return false;
+	const candidate = value as Record<string, unknown>;
+	return (
+		Number.isSafeInteger(candidate.pid) &&
+		(candidate.pid as number) > 0 &&
+		typeof candidate.incarnation === "string" &&
+		typeof candidate.createdAt === "number"
+	);
+}
+
+/**
+ * Acquire the daemon lifecycle transition lock using durable owner metadata.
+ * Reclaims only dead, PID-reused, or TTL-expired markers; fresh unknown markers
+ * are retained because they may be a creator between exclusive open and write.
+ */
+export async function acquireDaemonTransitionLock(input: {
+	fs: {
+		readFile(file: string, encoding: "utf8"): Promise<string>;
+		writeFile?(file: string, data: string, opts?: WriteFileOptions): Promise<void>;
+		unlink(file: string): Promise<void>;
+		stat?(file: string): Promise<{ mtimeMs: number }>;
+	};
+	path: string;
+	createExclusive: (file: string) => Promise<boolean>;
+	pid: number;
+	pidAlive: (pid: number) => boolean;
+	pidIncarnation: (pid: number) => string | undefined;
+	now?: () => number;
+	sleep?: (ms: number) => Promise<void>;
+	retries?: number;
+	retryDelayMs?: number;
+}): Promise<boolean> {
+	const sleep = input.sleep ?? (async (ms: number) => await Bun.sleep(ms));
+	const now = input.now ?? Date.now;
+	const retries = Math.max(input.retries ?? 5, 0);
+	const retryDelayMs = Math.max(input.retryDelayMs ?? 20, 0);
+	const incarnation = input.pidIncarnation(input.pid);
+	if (!incarnation) return false;
+	const owner: DaemonTransitionLock = { pid: input.pid, incarnation, createdAt: now() };
+	for (let attempt = 0; attempt <= retries; attempt++) {
+		if (await input.createExclusive(input.path)) {
+			await input.fs.writeFile?.(input.path, `${JSON.stringify(owner)}\n`, { mode: 0o600 });
+			return true;
+		}
+		const raw = await input.fs.readFile(input.path, "utf8").catch(() => undefined);
+		let current: unknown;
+		try {
+			current = raw === undefined ? undefined : JSON.parse(raw);
+		} catch {
+			current = undefined;
+		}
+		if (isDaemonTransitionLock(current)) {
+			const currentIncarnation = input.pidIncarnation(current.pid);
+			if (
+				!input.pidAlive(current.pid) ||
+				(currentIncarnation !== undefined && currentIncarnation !== current.incarnation) ||
+				now() - current.createdAt >= TRANSITION_LOCK_STALE_MS
+			)
+				await input.fs.unlink(input.path).catch(() => undefined);
+		} else {
+			const metadata = await input.fs.stat?.(input.path).catch(() => undefined);
+			if (metadata && now() - metadata.mtimeMs >= TRANSITION_LOCK_STALE_MS)
+				await input.fs.unlink(input.path).catch(() => undefined);
+		}
+		if (attempt < retries) await sleep(retryDelayMs);
+	}
+	return false;
+}
+
+function defaultTransitionPidAlive(pid: number): boolean {
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch (err) {
+		return (err as NodeJS.ErrnoException).code === "EPERM";
+	}
+}
+
+function defaultTransitionPidIncarnation(pid: number): string | undefined {
+	return processIncarnation(pid);
+}
+
 /**
  * Owner-bound removal of a dead daemon's lock. Closes the classic
  * check-then-unlink TOCTOU: a naive `unlink(lock)` after observing a dead owner
@@ -662,7 +759,17 @@ async function removeDeadOwnerLock(
 	pidAlive: (pid: number) => boolean,
 	expected: NormalizedDaemonState,
 ): Promise<"cleared" | "contended" | "superseded" | "now-alive" | "unlink-failed"> {
-	if (!(await fs.createExclusive(paths.steal))) return "contended";
+	if (
+		!(await acquireDaemonTransitionLock({
+			fs,
+			path: paths.steal,
+			createExclusive: fs.createExclusive,
+			pid: process.pid,
+			pidAlive: defaultTransitionPidAlive,
+			pidIncarnation: defaultTransitionPidIncarnation,
+		}))
+	)
+		return "contended";
 	try {
 		const current = await readDaemonStateFile(fs, paths.state);
 		if (!current || current.ownerId !== expected.ownerId || current.pid !== expected.pid) {

@@ -1,4 +1,4 @@
-import { spawn as childProcessSpawn, spawnSync } from "node:child_process";
+import { spawn as childProcessSpawn } from "node:child_process";
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -12,10 +12,24 @@ import type {
 	DaemonStatus,
 } from "../../daemon/control-types";
 import { resolveGjcRuntimeSpawnInfo } from "../../daemon/runtime";
+import { processIncarnation } from "../broker/process-incarnation";
 import { getNotificationConfig, isDiscordConfigured, isSlackConfigured } from "./config";
 
 export type ChatDaemonKind = "discord" | "slack";
 export type ChatDaemonAction = "stop" | "reload";
+
+/**
+ * Operational generations of the Discord/Slack daemon lifecycle contracts.
+ * These are intentionally separate from per-session endpoint generations.
+ */
+export const CHAT_DAEMON_GENERATIONS: Readonly<Record<ChatDaemonKind, number>> = {
+	discord: 3,
+	slack: 3,
+};
+
+export function chatDaemonGeneration(kind: ChatDaemonKind): number {
+	return CHAT_DAEMON_GENERATIONS[kind];
+}
 
 export interface ChatDaemonState {
 	version: 1;
@@ -27,7 +41,62 @@ export interface ChatDaemonState {
 	startedAt: number;
 	heartbeatAt: number;
 	transportHealthy: boolean;
+	generation: number;
 	stoppedAt?: number;
+}
+
+/**
+ * State files are untrusted persisted input. A record must be completely valid
+ * before its PID can be treated as an owner, stopped, or safe to replace.
+ */
+/** A legacy owner is recognized only when the sole missing field is generation. */
+export function isRecognizedLegacyGeneration(value: unknown): value is undefined {
+	return value === undefined;
+}
+
+function hasProcessIncarnationAuthority(incarnation: unknown): incarnation is string {
+	return typeof incarnation === "string" && incarnation.length > 0 && incarnation !== "unavailable";
+}
+
+function hasSafeChatDaemonOwnerShape(
+	value: unknown,
+): value is Omit<ChatDaemonState, "generation"> & { generation?: unknown } {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+	const state = value as Record<string, unknown>;
+	return (
+		state.version === 1 &&
+		(state.kind === "discord" || state.kind === "slack") &&
+		typeof state.pid === "number" &&
+		Number.isSafeInteger(state.pid) &&
+		state.pid > 0 &&
+		typeof state.ownerId === "string" &&
+		state.ownerId.length > 0 &&
+		typeof state.identity === "string" &&
+		state.identity.length > 0 &&
+		hasProcessIncarnationAuthority(state.incarnation) &&
+		typeof state.startedAt === "number" &&
+		Number.isFinite(state.startedAt) &&
+		typeof state.heartbeatAt === "number" &&
+		Number.isFinite(state.heartbeatAt) &&
+		typeof state.transportHealthy === "boolean" &&
+		(state.stoppedAt === undefined || (typeof state.stoppedAt === "number" && Number.isFinite(state.stoppedAt)))
+	);
+}
+
+export function hasSafeChatDaemonStateShape(value: unknown): value is ChatDaemonState {
+	if (!hasSafeChatDaemonOwnerShape(value)) return false;
+	const state = value as Record<string, unknown>;
+	return typeof state.generation === "number" && Number.isSafeInteger(state.generation) && state.generation >= 0;
+}
+
+function hasChatDaemonStatePid(value: unknown): value is { pid: number } {
+	return (
+		!!value &&
+		typeof value === "object" &&
+		typeof (value as { pid?: unknown }).pid === "number" &&
+		Number.isSafeInteger((value as { pid: number }).pid) &&
+		(value as { pid: number }).pid > 0
+	);
 }
 
 export interface ChatDaemonControlRequest {
@@ -49,12 +118,15 @@ export interface ChatDaemonControlDeps {
 	randomId?: () => string;
 	pidIncarnation?: (pid: number) => string | undefined;
 	sleep?: (ms: number) => Promise<void>;
+	spawnReadyTimeoutMs?: number;
 }
 
 const HEARTBEAT_TTL_MS = 20_000;
 const DEFAULT_GRACEFUL_TIMEOUT_MS = 8_000;
 const DEFAULT_KILL_TIMEOUT_MS = 3_000;
 const UNPUBLISHED_OWNER_LOCK_STALE_MS = HEARTBEAT_TTL_MS;
+/** Covers Discord READY plus its first 5-second heartbeat; tests inject a smaller timeout. */
+const DEFAULT_SPAWN_READY_TIMEOUT_MS = 8_000;
 
 interface ChatDaemonOwnerLock {
 	pid: number;
@@ -121,27 +193,10 @@ function defaultSignal(pid: number, signal: NodeJS.Signals): void {
 		process.kill(pid, signal);
 	} catch {}
 }
+/** Windows process ownership uses immutable StartTime/FileTime provenance through
+ * the shared native/platform authority. Without authority, numeric PIDs are never trusted. */
 function defaultPidIncarnation(pid: number): string | undefined {
-	if (!Number.isSafeInteger(pid) || pid <= 0) return undefined;
-	if (process.platform === "linux") {
-		try {
-			const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
-			return `linux:${
-				stat
-					.slice(stat.lastIndexOf(")") + 2)
-					.trim()
-					.split(/\s+/)[19]
-			}`;
-		} catch {
-			return undefined;
-		}
-	}
-	if (process.platform === "darwin") {
-		const result = spawnSync("ps", ["-o", "lstart=", "-p", String(pid)], { encoding: "utf8" });
-		const startedAt = result.status === 0 ? result.stdout.trim() : "";
-		return startedAt ? `darwin:${startedAt}` : undefined;
-	}
-	return undefined;
+	return processIncarnation(pid);
 }
 function runtimeInfo(execPath?: string): DaemonRuntimeInfo {
 	const rt = resolveGjcRuntimeSpawnInfo(execPath ?? process.execPath);
@@ -239,6 +294,8 @@ export function buildChatDaemonSpawnArgs(input: {
 	};
 }
 
+type ChatDaemonStateClassification = "absent" | "replaceable" | "compatible" | "malformed" | "unauthorized" | "stopped";
+
 export class ChatDaemonController implements BuiltInDaemonController {
 	readonly kind: ChatDaemonKind;
 	constructor(
@@ -257,20 +314,9 @@ export class ChatDaemonController implements BuiltInDaemonController {
 	async status(): Promise<DaemonStatus> {
 		const runtime = runtimeInfo(this.deps.execPath);
 		const identity = this.identity();
-		if (!identity) return { kind: this.kind, configured: false, health: "not_configured", runtime };
 		const state = await readChatDaemonState(this.settings.getAgentDir(), this.kind);
-		const live = Boolean(
-			state &&
-				state.version === 1 &&
-				state.kind === this.kind &&
-				state.identity === identity &&
-				!state.stoppedAt &&
-				state.transportHealthy &&
-				Date.now() - state.heartbeatAt <= HEARTBEAT_TTL_MS &&
-				this.alive(state.pid) &&
-				this.incarnation(state.pid) === state.incarnation,
-		);
-		const health: DaemonHealth = live ? "running" : state && !state.stoppedAt ? "stale" : "stopped";
+		if (!identity) return { kind: this.kind, configured: false, health: "not_configured", runtime };
+		const health: DaemonHealth = this.stateHealth(state, identity);
 		return {
 			kind: this.kind,
 			configured: true,
@@ -292,14 +338,25 @@ export class ChatDaemonController implements BuiltInDaemonController {
 		const identity = this.identity();
 		if (!identity) return "disabled";
 		const existing = await readChatDaemonState(this.settings.getAgentDir(), this.kind);
-		if (existing && this.isLiveState(existing)) {
-			if (existing.identity === identity) return "attached";
+		const classification = this.classify(existing, identity);
+		if (classification === "malformed" || classification === "unauthorized")
+			throw new Error(`Unable to replace unauthorized ${this.kind} daemon owner`);
+		if (existing && this.isSignalableMatchingOwner(existing)) {
+			if (classification === "compatible") {
+				// A compatible, physically-live owner may be mid-startup: a concurrent
+				// ensure can have just acquired ownership and published transportHealthy:false
+				// before its transport heartbeats healthy. Wait bounded for that owner to
+				// become attachable instead of failing a racing startup outright.
+				if (this.isHealthyFreshState(existing) || (await this.waitForOwnership(existing.ownerId, identity)))
+					return "attached";
+				throw new Error(`Unable to replace unhealthy ${this.kind} daemon owner`);
+			}
 			await this.stopForReplacement(existing);
 		}
 		const spawned = await this.spawn();
 		if (spawned) return "owner_spawned";
 		const replacement = await readChatDaemonState(this.settings.getAgentDir(), this.kind);
-		if (replacement && replacement.identity === identity && this.isLiveState(replacement)) return "attached";
+		if (replacement && this.isCurrentCompatibleState(replacement, identity)) return "attached";
 		throw new Error(`Unable to attach or spawn ${this.kind} daemon owner`);
 	}
 
@@ -308,24 +365,45 @@ export class ChatDaemonController implements BuiltInDaemonController {
 		const warnings = before.runtime.warning ? [before.runtime.warning] : [];
 		if (!before.configured)
 			return this.result(action, false, `${this.kind} notifications are not configured`, before, before, warnings);
-		if (before.health !== "running") {
-			if (action === "stop")
+		const state = await readChatDaemonState(this.settings.getAgentDir(), this.kind);
+		const classification = this.classify(state, this.identity());
+		if (classification === "malformed" || classification === "unauthorized")
+			return this.result(
+				action,
+				false,
+				`${this.kind} daemon ownership changed; refusing to signal`,
+				before,
+				await this.status(),
+				warnings,
+			);
+		if (!state || !this.isSignalableMatchingOwner(state)) {
+			if (action === "stop") {
+				if (state && this.isAmbiguouslyLiveState(state))
+					return this.result(
+						action,
+						false,
+						`${this.kind} daemon ownership changed; refusing to signal`,
+						before,
+						before,
+						warnings,
+					);
 				return this.result(action, true, `no running ${this.kind} daemon`, before, before, warnings);
+			}
 			if (opts.spawnIfStopped === false)
 				return this.result(action, true, `no running ${this.kind} daemon to reload`, before, before, warnings);
 			const spawned = await this.spawn();
-			const after = await this.status();
 			return this.result(
 				action,
 				spawned,
-				spawned ? `spawned fresh ${this.kind} daemon` : `a live ${this.kind} owner already exists`,
+				spawned
+					? `spawned fresh ${this.kind} daemon`
+					: `${this.kind} daemon did not publish ownership after spawning`,
 				before,
-				after,
+				await this.status(),
 				warnings,
 			);
 		}
-		const state = await readChatDaemonState(this.settings.getAgentDir(), this.kind);
-		if (!state || !this.ownsCapturedState(state, before))
+		if (state.identity !== this.identity() || !this.ownsCapturedState(state, before))
 			return this.result(
 				action,
 				false,
@@ -379,20 +457,65 @@ export class ChatDaemonController implements BuiltInDaemonController {
 	private incarnation(pid: number): string | undefined {
 		return (this.deps.pidIncarnation ?? defaultPidIncarnation)(pid);
 	}
-	private isLiveState(state: ChatDaemonState): boolean {
+	private isDefinitelyStoppedState(state: ChatDaemonState | undefined): boolean {
+		if (!state || !hasSafeChatDaemonOwnerShape(state)) return false;
+		if (!this.alive(state.pid)) return true;
+		// Proven PID reuse means this persisted owner is gone. The distinct live PID
+		// remains nonsignalable because isSignalableMatchingOwner requires equality.
+		const incarnation = this.incarnation(state.pid);
+		return hasProcessIncarnationAuthority(incarnation) && incarnation !== state.incarnation;
+	}
+	private stateHealth(state: ChatDaemonState | undefined, identity: string): DaemonHealth {
+		if (!state || this.isDefinitelyStoppedState(state)) return "stopped";
+		if (this.isCurrentCompatibleState(state, identity)) return "running";
+		// A PID that is live but cannot prove a matching current incarnation is
+		// ambiguous: do not report it ready or overwrite it.
+		return "stale";
+	}
+	private isSignalableMatchingOwner(state: ChatDaemonState): boolean {
+		const incarnation = this.incarnation(state.pid);
 		return (
-			state.version === 1 &&
+			hasSafeChatDaemonOwnerShape(state) &&
 			state.kind === this.kind &&
-			!state.stoppedAt &&
-			state.transportHealthy &&
-			Date.now() - state.heartbeatAt <= HEARTBEAT_TTL_MS &&
+			state.stoppedAt === undefined &&
 			this.alive(state.pid) &&
-			Boolean(state.incarnation) &&
-			this.incarnation(state.pid) === state.incarnation
+			hasProcessIncarnationAuthority(incarnation) &&
+			incarnation === state.incarnation
 		);
 	}
+	/** A live PID with an invalid ownership record is never safe to overwrite. */
+	private isAmbiguouslyLiveState(state: ChatDaemonState): boolean {
+		return !this.isDefinitelyStoppedState(state) && !this.isSignalableMatchingOwner(state);
+	}
+
+	private isHealthyFreshState(state: ChatDaemonState): boolean {
+		return (
+			hasSafeChatDaemonStateShape(state) &&
+			state.transportHealthy &&
+			Date.now() - state.heartbeatAt <= HEARTBEAT_TTL_MS
+		);
+	}
+	private classify(state: ChatDaemonState | undefined, identity: string | undefined): ChatDaemonStateClassification {
+		if (!state) return "absent";
+		if (!hasSafeChatDaemonOwnerShape(state)) return "malformed";
+		if (this.isDefinitelyStoppedState(state)) return "stopped";
+		if (!identity || state.kind !== this.kind || state.identity !== identity) return "unauthorized";
+		if (hasSafeChatDaemonStateShape(state))
+			return state.generation < chatDaemonGeneration(this.kind) ? "replaceable" : "compatible";
+		const generation = (state as { generation?: unknown }).generation;
+		return isRecognizedLegacyGeneration(generation) ? "replaceable" : "malformed";
+	}
+	private isCurrentCompatibleState(state: ChatDaemonState, identity: string): boolean {
+		return (
+			this.isSignalableMatchingOwner(state) &&
+			this.isHealthyFreshState(state) &&
+			this.classify(state, identity) === "compatible"
+		);
+	}
+
 	private async stopForReplacement(state: ChatDaemonState): Promise<void> {
-		if (!this.isLiveState(state)) return;
+		if (!this.isSignalableMatchingOwner(state)) return;
+
 		const requestId = this.deps.randomId?.() ?? crypto.randomUUID();
 		await writeChatDaemonControlRequest(this.settings.getAgentDir(), this.kind, {
 			version: 1,
@@ -423,17 +546,23 @@ export class ChatDaemonController implements BuiltInDaemonController {
 			state.ownerId === before.ownerId &&
 			state.pid === before.pid &&
 			Boolean(state.incarnation) &&
-			this.incarnation(state.pid) === state.incarnation
+			this.isSignalableMatchingOwner(state)
 		);
 	}
 	private async signalIfOwner(state: ChatDaemonState, signal: NodeJS.Signals): Promise<boolean> {
 		const current = await readChatDaemonState(this.settings.getAgentDir(), this.kind);
+		const identity = this.identity();
+		const classification = this.classify(current, identity);
 		if (
+			!identity ||
 			!current ||
 			current.ownerId !== state.ownerId ||
 			current.pid !== state.pid ||
+			current.identity !== state.identity ||
 			current.incarnation !== state.incarnation ||
-			this.incarnation(state.pid) !== state.incarnation
+			current.generation !== state.generation ||
+			(classification !== "compatible" && classification !== "replaceable") ||
+			!this.isSignalableMatchingOwner(current)
 		)
 			return false;
 		(this.deps.sendSignal ?? defaultSignal)(state.pid, signal);
@@ -479,15 +608,10 @@ export class ChatDaemonController implements BuiltInDaemonController {
 		const paths = chatDaemonPaths(this.settings.getAgentDir(), this.kind);
 		await fs.promises.mkdir(paths.dir, { recursive: true, mode: 0o700 });
 		const existing = await readChatDaemonState(this.settings.getAgentDir(), this.kind);
-		if (
-			existing &&
-			!existing.stoppedAt &&
-			existing.identity === identity &&
-			Date.now() - existing.heartbeatAt <= HEARTBEAT_TTL_MS &&
-			this.alive(existing.pid) &&
-			this.incarnation(existing.pid) === existing.incarnation
-		)
-			return false;
+		const classification = this.classify(existing, identity);
+		if (classification === "malformed" || classification === "unauthorized") return false;
+		if (existing && (this.isSignalableMatchingOwner(existing) || this.isAmbiguouslyLiveState(existing))) return false;
+
 		const ownerId = `${this.deps.ownerPid ?? process.ppid}-${this.deps.randomId?.() ?? crypto.randomUUID()}`;
 		const { command, args } = buildChatDaemonSpawnArgs({
 			kind: this.kind,
@@ -499,7 +623,25 @@ export class ChatDaemonController implements BuiltInDaemonController {
 			detached: true,
 			stdio: "ignore",
 		}).unref?.();
-		return true;
+		return await this.waitForOwnership(ownerId, identity);
+	}
+	private async waitForOwnership(ownerId: string, identity: string): Promise<boolean> {
+		const timeoutMs = Math.max(this.deps.spawnReadyTimeoutMs ?? DEFAULT_SPAWN_READY_TIMEOUT_MS, 0);
+		const until = Date.now() + timeoutMs;
+		const maxPolls = Math.ceil(timeoutMs / 25);
+		for (let poll = 0; poll <= maxPolls; poll++) {
+			const state = await readChatDaemonState(this.settings.getAgentDir(), this.kind);
+			if (
+				state &&
+				state.ownerId === ownerId &&
+				this.classify(state, identity) === "compatible" &&
+				this.isCurrentCompatibleState(state, identity)
+			)
+				return true;
+			if (Date.now() >= until || poll === maxPolls) return false;
+			await this.sleep(25);
+		}
+		return false;
 	}
 }
 
@@ -543,8 +685,22 @@ export async function acquireChatDaemonOwnership(input: {
 		pidAlive: input.pidAlive ?? defaultPidAlive,
 		pidIncarnation: input.pidIncarnation ?? defaultPidIncarnation,
 	};
-	const incarnation = input.incarnation ?? probe.pidIncarnation(pid) ?? "unavailable";
+	const incarnation = input.incarnation ?? probe.pidIncarnation(pid);
+	if (!hasProcessIncarnationAuthority(incarnation)) return false;
+
 	await fs.promises.mkdir(paths.dir, { recursive: true, mode: 0o700 });
+	const existing = await readJson<unknown>(paths.state);
+	// A live record remains fenced unless authoritative provenance proves the PID
+	// was reused. This permits recovery without ever signaling that replacement.
+	if (hasChatDaemonStatePid(existing) && probe.pidAlive(existing.pid)) {
+		const current = probe.pidIncarnation(existing.pid);
+		if (
+			!hasSafeChatDaemonOwnerShape(existing) ||
+			!hasProcessIncarnationAuthority(current) ||
+			current === existing.incarnation
+		)
+			return false;
+	}
 	if (!(await createChatDaemonOwnerLock(paths.lock, { pid, incarnation, createdAt: Date.now() }))) {
 		if (!(await reclaimChatDaemonOwnerLock(paths.lock, paths.state, probe))) return false;
 		if (!(await createChatDaemonOwnerLock(paths.lock, { pid, incarnation, createdAt: Date.now() }))) return false;
@@ -563,6 +719,7 @@ export async function acquireChatDaemonOwnership(input: {
 				startedAt: Date.now(),
 				heartbeatAt: Date.now(),
 				transportHealthy: false,
+				generation: chatDaemonGeneration(input.kind),
 			} satisfies ChatDaemonState),
 	);
 	return true;
@@ -645,8 +802,16 @@ async function canReclaimChatDaemonOwnerLock(
 	stateFile: string,
 	probe: ChatDaemonOwnershipProbe,
 ): Promise<boolean> {
-	const state = await readJson<ChatDaemonState>(stateFile);
-	if (state && probe.pidAlive(state.pid) && probe.pidIncarnation(state.pid) === state.incarnation) return false;
+	const state = await readJson<unknown>(stateFile);
+	if (hasChatDaemonStatePid(state) && probe.pidAlive(state.pid)) {
+		const current = probe.pidIncarnation(state.pid);
+		if (
+			!hasSafeChatDaemonOwnerShape(state) ||
+			!hasProcessIncarnationAuthority(current) ||
+			current === state.incarnation
+		)
+			return false;
+	}
 	return await isStaleChatDaemonLock(lock, probe);
 }
 
@@ -675,10 +840,10 @@ export async function renewChatDaemonHeartbeat(input: {
 }): Promise<boolean> {
 	const paths = chatDaemonPaths(input.agentDir, input.kind);
 	return await withStateWriteLock(paths.state, async () => {
-		const state = await readJson<ChatDaemonState>(paths.state);
-		const pid = input.pid ?? state?.pid;
+		const state = await readJson<unknown>(paths.state);
+		if (!hasSafeChatDaemonStateShape(state)) return false;
+		const pid = input.pid ?? state.pid;
 		if (
-			!state ||
 			state.ownerId !== input.ownerId ||
 			pid !== state.pid ||
 			!input.incarnation ||
@@ -693,16 +858,23 @@ export async function releaseChatDaemonOwnership(input: {
 	agentDir: string;
 	kind: ChatDaemonKind;
 	ownerId: string;
-	pid?: number;
-	incarnation?: string;
+	pid: number;
+	incarnation: string;
+	pidAlive?: (pid: number) => boolean;
+	pidIncarnation?: (pid: number) => string | undefined;
 }): Promise<void> {
 	const paths = chatDaemonPaths(input.agentDir, input.kind);
+	const pidAlive = input.pidAlive ?? defaultPidAlive;
+	const pidIncarnation = input.pidIncarnation ?? defaultPidIncarnation;
 	await withStateWriteLock(paths.state, async () => {
-		const state = await readJson<ChatDaemonState>(paths.state);
+		const state = await readJson<unknown>(paths.state);
 		if (
-			state?.ownerId !== input.ownerId ||
-			(input.pid !== undefined && state.pid !== input.pid) ||
-			(input.incarnation !== undefined && state.incarnation !== input.incarnation)
+			!hasSafeChatDaemonStateShape(state) ||
+			state.ownerId !== input.ownerId ||
+			state.pid !== input.pid ||
+			state.incarnation !== input.incarnation ||
+			!pidAlive(input.pid) ||
+			pidIncarnation(input.pid) !== input.incarnation
 		)
 			return;
 		await writeJson(paths.state, { ...state, stoppedAt: Date.now(), transportHealthy: false });
