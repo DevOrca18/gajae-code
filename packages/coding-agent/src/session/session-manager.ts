@@ -87,12 +87,11 @@ import type {
 } from "./session-storage";
 import { FileSessionStorage, MemorySessionStorage } from "./session-storage";
 
-export const CURRENT_SESSION_VERSION = 4;
+export const CURRENT_SESSION_VERSION = 5;
 
 /**
- * Version 4 adds append-only patch records. New writers emit v4 headers; v1–v3
- * transcripts remain readable. Older builds do not apply these records, so they
- * must not be used to edit a session after a v4 writer has updated it.
+ * Version 5 separates persisted MCP and discovered-built-in selection authority.
+ * Version 4 patch records remain readable; older writers must not edit v5 sessions.
  */
 
 function isUnderProjectGjc(cwd: string, targetPath: string): boolean {
@@ -321,13 +320,19 @@ export interface TtsrInjectionEntry extends SessionEntryBase {
 	ttsrMessageCount?: number;
 }
 
-/** Persisted discovery selection state for a session branch. */
+/** Persisted MCP discovery selection state for a session branch. */
 export interface MCPToolSelectionEntry extends SessionEntryBase {
 	type: "mcp_tool_selection";
 	/** MCP tool names selected for visibility in discovery mode. */
 	selectedToolNames: string[];
-	/** Built-in discoverable tool names activated in all-discovery mode. */
+	/** Legacy v4 combined built-in authority, retained for read compatibility. */
 	selectedDiscoveredBuiltinToolNames?: string[];
+}
+
+/** Persisted discovered-built-in selection state, independent of MCP authority. */
+export interface DiscoveredBuiltinToolSelectionEntry extends SessionEntryBase {
+	type: "discovered_builtin_tool_selection";
+	selectedToolNames: string[];
 }
 
 /** Session init entry - captures initial context for subagent sessions (debugging/replay). */
@@ -391,6 +396,7 @@ export type SessionEntry =
 	| LabelEntry
 	| TtsrInjectionEntry
 	| MCPToolSelectionEntry
+	| DiscoveredBuiltinToolSelectionEntry
 	| SessionInitEntry
 	| ModeChangeEntry
 	| ConfiguredModelChainEntry;
@@ -462,6 +468,8 @@ export interface SessionContext {
 	selectedDiscoveredBuiltinToolNames?: string[];
 	/** Whether this branch contains an explicit persisted MCP selection entry. */
 	hasPersistedMCPToolSelection: boolean;
+	/** Whether this branch contains an explicit persisted discovered-built-in selection entry. */
+	hasPersistedDiscoveredBuiltinToolSelection?: boolean;
 	/** Active mode (e.g. "plan") or "none" if no special mode is active */
 	mode: string;
 	/** Mode-specific data from the last mode_change entry */
@@ -812,21 +820,27 @@ function resolveManagedSessionRoot(sessionDir: string, cwd: string): string | un
 /** Exported for compaction.test.ts */
 export function parseSessionEntries(content: string): FileEntry[] {
 	const records = parseJsonlLenient<FileEntry | SessionPatchRecord>(content);
+	const rawHeader = records.find((record): record is SessionHeader => record.type === "session");
+	if (
+		rawHeader?.version !== undefined &&
+		(!Number.isInteger(rawHeader.version) || rawHeader.version > CURRENT_SESSION_VERSION)
+	) {
+		throw new Error(`Unsupported session version: ${String(rawHeader.version)}`);
+	}
 	const entries: FileEntry[] = [];
 	const entriesById = new Map<string, SessionEntry>();
 	let header: SessionHeader | undefined;
 
 	for (const record of records) {
-		// Patch records are defined only by v4 transcripts. Ignore them before a
-		// v4 header as well: a truncated or malicious prefix must not mutate a
-		// later header/entry when replay catches up.
+		// Patch records are valid in v4 and v5 only. Ignore patches before a valid
+		// header so malformed prefixes cannot affect later records.
 		if (record.type === "header_patch") {
-			if (header?.version === CURRENT_SESSION_VERSION && isHeaderPatchRecord(record))
+			if (header?.version !== undefined && header.version >= 4 && isHeaderPatchRecord(record))
 				applyHeaderPatch(header, record.patch);
 			continue;
 		}
 		if (record.type === "entry_patch") {
-			if (header?.version === CURRENT_SESSION_VERSION && isEntryPatchRecord(record)) {
+			if (header?.version !== undefined && header.version >= 4 && isEntryPatchRecord(record)) {
 				const entry = entriesById.get(record.entryId);
 				if (entry?.type === "message" && record.patch.message) entry.message = record.patch.message;
 			}
@@ -943,6 +957,7 @@ export function buildSessionContext(
 
 			selectedMCPToolNames: [],
 			hasPersistedMCPToolSelection: false,
+			hasPersistedDiscoveredBuiltinToolSelection: false,
 			mode: "none",
 		};
 	}
@@ -967,6 +982,7 @@ export function buildSessionContext(
 			ttsrMessageCount: 0,
 			selectedMCPToolNames: [],
 			hasPersistedMCPToolSelection: false,
+			hasPersistedDiscoveredBuiltinToolSelection: false,
 			mode: "none",
 		};
 	}
@@ -997,6 +1013,7 @@ export function buildSessionContext(
 	let selectedMCPToolNames: string[] = [];
 	let hasPersistedMCPToolSelection = false;
 	let selectedDiscoveredBuiltinToolNames: string[] | undefined;
+	let hasPersistedDiscoveredBuiltinToolSelection = false;
 	let mode = "none";
 	let modeData: Record<string, unknown> | undefined;
 	// Track whether an explicit `model_change` with role="default" has been
@@ -1059,8 +1076,12 @@ export function buildSessionContext(
 			selectedMCPToolNames = [...entry.selectedToolNames];
 			if (entry.selectedDiscoveredBuiltinToolNames !== undefined) {
 				selectedDiscoveredBuiltinToolNames = [...entry.selectedDiscoveredBuiltinToolNames];
+				hasPersistedDiscoveredBuiltinToolSelection = true;
 			}
 			hasPersistedMCPToolSelection = true;
+		} else if (entry.type === "discovered_builtin_tool_selection") {
+			selectedDiscoveredBuiltinToolNames = [...entry.selectedToolNames];
+			hasPersistedDiscoveredBuiltinToolSelection = true;
 		} else if (entry.type === "mode_change") {
 			mode = entry.mode;
 			modeData = entry.data;
@@ -1186,6 +1207,7 @@ export function buildSessionContext(
 		selectedMCPToolNames,
 		selectedDiscoveredBuiltinToolNames,
 		hasPersistedMCPToolSelection,
+		hasPersistedDiscoveredBuiltinToolSelection,
 		mode,
 		modeData,
 	};
@@ -1491,6 +1513,13 @@ function hasStrictSessionSchema(entries: FileEntry[]): boolean {
 					(value.selectedDiscoveredBuiltinToolNames !== undefined &&
 						(!Array.isArray(value.selectedDiscoveredBuiltinToolNames) ||
 							!value.selectedDiscoveredBuiltinToolNames.every(name => typeof name === "string")))
+				)
+					return false;
+				break;
+			case "discovered_builtin_tool_selection":
+				if (
+					!Array.isArray(value.selectedToolNames) ||
+					!value.selectedToolNames.every(name => typeof name === "string")
 				)
 					return false;
 				break;
@@ -1822,7 +1851,11 @@ async function getSortedSessions(sessionDir: string, storage: SessionStorage): P
 					if (entries.length === 0) return;
 					const header = entries[0] as Record<string, unknown>;
 					if (header.type !== "session" || typeof header.id !== "string") return;
-					if (header.version === CURRENT_SESSION_VERSION) {
+					if (
+						typeof header.version === "number" &&
+						header.version >= 4 &&
+						header.version <= CURRENT_SESSION_VERSION
+					) {
 						for (const patch of await readSessionListTrailingPatches(path, storage, buffer)) {
 							applySessionListHeaderPatch(header as unknown as SessionListHeader, patch);
 						}
@@ -3504,7 +3537,7 @@ async function collectSessionFromFile(
 		const entries = parseSessionEntries(content).map(entry => entry as unknown as Record<string, unknown>);
 		const header = parseSessionListHeader(content, entries);
 		if (!header) return undefined;
-		if (header.version === CURRENT_SESSION_VERSION) {
+		if (typeof header.version === "number" && header.version >= 4 && header.version <= CURRENT_SESSION_VERSION) {
 			for (const patch of await readSessionListTrailingPatches(file, storage, buffer)) {
 				applySessionListHeaderPatch(header, patch);
 			}
@@ -5477,6 +5510,19 @@ export class SessionManager {
 			...(selectedDiscoveredBuiltinToolNames
 				? { selectedDiscoveredBuiltinToolNames: [...selectedDiscoveredBuiltinToolNames] }
 				: {}),
+		};
+		this.#appendEntry(entry);
+		return entry.id;
+	}
+
+	/** Append discovered built-in selection authority without altering MCP authority. */
+	appendDiscoveredBuiltinToolSelection(selectedToolNames: string[]): string {
+		const entry: DiscoveredBuiltinToolSelectionEntry = {
+			type: "discovered_builtin_tool_selection",
+			id: generateId(this.#byId),
+			parentId: this.#leafId,
+			timestamp: new Date().toISOString(),
+			selectedToolNames: [...selectedToolNames],
 		};
 		this.#appendEntry(entry);
 		return entry.id;

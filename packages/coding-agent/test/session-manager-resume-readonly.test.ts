@@ -5,6 +5,7 @@ import * as path from "node:path";
 import { deleteSessionPickerCandidate } from "@gajae-code/coding-agent/cli/session-picker";
 import {
 	createReadonlySessionManager,
+	parseSessionEntries,
 	type ResumeSessionIdentity,
 	SessionManager,
 	type StrictSessionOpenResult,
@@ -253,6 +254,20 @@ describe("SessionManager read-only resume", () => {
 		expect(fs.statSync(filePath, { bigint: true }).mtimeNs).toBe(beforeMtimeNs);
 	});
 
+	it("rejects future-version patch records before replay", () => {
+		const content = [
+			JSON.stringify({
+				type: "session",
+				version: 6,
+				id: "future",
+				timestamp: new Date(0).toISOString(),
+				cwd: "/cwd",
+			}),
+			JSON.stringify({ type: "header_patch", patch: { title: "must-not-apply" } }),
+		].join("\n");
+		expect(() => parseSessionEntries(content)).toThrow("Unsupported session version: 6");
+	});
+
 	it("exposes descriptor-bound device and inode identity", async () => {
 		const storage = new MemorySessionStorage();
 		const filePath = "/sessions/identity.jsonl";
@@ -450,7 +465,7 @@ describe("SessionManager read-only resume", () => {
 		});
 	});
 
-	it("preserves inspected migration state until the first v4 persistence rewrite", async () => {
+	it("preserves inspected migration state until the first v5 persistence rewrite", async () => {
 		const storage = new WriteTrackingStorage();
 		const filePath = "/sessions/legacy-v2.jsonl";
 		const header = {
@@ -485,7 +500,7 @@ describe("SessionManager read-only resume", () => {
 			.trim()
 			.split("\n")
 			.map(line => JSON.parse(line));
-		expect(rewritten[0]).toMatchObject({ type: "session", version: 4 });
+		expect(rewritten[0]).toMatchObject({ type: "session", version: 5 });
 		expect(rewritten).toHaveLength(3);
 		expect(rewritten.every(line => line.type === "session" || typeof line.id === "string")).toBe(true);
 	});

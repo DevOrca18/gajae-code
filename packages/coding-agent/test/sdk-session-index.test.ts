@@ -11,6 +11,10 @@ const event = (sessionId: string) => ({
 	endpointGeneration: 1,
 	pid: process.pid,
 });
+
+function deferred<T = void>() {
+	return Promise.withResolvers<T>();
+}
 describe("SDK session index", () => {
 	it("diagnoses a missing index without creating session directories", async () => {
 		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-missing-"));
@@ -20,6 +24,80 @@ describe("SDK session index", () => {
 			snapshotSeq: 0,
 		});
 		expect(await fs.exists(path.join(dir, "sdk", "sessions"))).toBe(false);
+	});
+	it("coordinates concurrent opens for one normalized index path", async () => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-open-"));
+		const sessionsDir = path.join(dir, "sdk", "sessions");
+		const entered = deferred();
+		const release = deferred();
+		const chmod = fs.chmod.bind(fs);
+		let chmodCalls = 0;
+		const spy = vi.spyOn(fs, "chmod").mockImplementation(async (file, mode) => {
+			if (path.resolve(file.toString()) === path.resolve(sessionsDir)) {
+				chmodCalls++;
+				entered.resolve();
+				await release.promise;
+			}
+			return await chmod(file, mode);
+		});
+		try {
+			const first = new SessionIndex(dir).open();
+			await entered.promise;
+			const second = new SessionIndex(path.join(dir, ".")).open();
+			release.resolve();
+			const [one, two] = await Promise.all([first, second]);
+			expect(chmodCalls).toBe(1);
+			expect(one).not.toBe(two);
+			expect(one.indexSeq).toBe(0);
+			expect(two.indexSeq).toBe(0);
+		} finally {
+			spy.mockRestore();
+		}
+	});
+	it("clears a failed open group so a later open can retry", async () => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-open-failure-"));
+		const sessionsDir = path.join(dir, "sdk", "sessions");
+		const chmod = fs.chmod.bind(fs);
+		let fail = true;
+		const error = new Error("chmod failed");
+		const spy = vi.spyOn(fs, "chmod").mockImplementation(async (file, mode) => {
+			if (fail && path.resolve(file.toString()) === path.resolve(sessionsDir)) {
+				fail = false;
+				throw error;
+			}
+			return await chmod(file, mode);
+		});
+		try {
+			await expect(new SessionIndex(dir).open()).rejects.toBe(error);
+			await expect(new SessionIndex(dir).open()).resolves.toBeInstanceOf(SessionIndex);
+		} finally {
+			spy.mockRestore();
+		}
+	});
+	it("does not serialize opens for different index paths", async () => {
+		const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-open-isolation-"));
+		const firstDir = path.join(root, "first");
+		const secondDir = path.join(root, "second");
+		const firstSessionsDir = path.join(firstDir, "sdk", "sessions");
+		const entered = deferred();
+		const release = deferred();
+		const chmod = fs.chmod.bind(fs);
+		const spy = vi.spyOn(fs, "chmod").mockImplementation(async (file, mode) => {
+			if (path.resolve(file.toString()) === path.resolve(firstSessionsDir)) {
+				entered.resolve();
+				await release.promise;
+			}
+			return await chmod(file, mode);
+		});
+		try {
+			const first = new SessionIndex(firstDir).open();
+			await entered.promise;
+			await expect(new SessionIndex(secondDir).open()).resolves.toBeInstanceOf(SessionIndex);
+			release.resolve();
+			await first;
+		} finally {
+			spy.mockRestore();
+		}
 	});
 	it("replays only rows after the snapshotted prefix", async () => {
 		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-"));

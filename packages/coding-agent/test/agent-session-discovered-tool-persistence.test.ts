@@ -17,11 +17,18 @@ function builtin(name: string, loadMode: "discoverable" | "essential" | "none" =
 describe("discovered built-in tool persistence", () => {
 	it("round-trips selected built-ins independently from MCP selections and supports explicit clearing", () => {
 		const session = SessionManager.inMemory();
-		session.appendMCPToolSelection(["mcp__docs_search"], ["search_tool_bm25"]);
-		expect(session.buildSessionContext().selectedDiscoveredBuiltinToolNames).toEqual(["search_tool_bm25"]);
+		session.appendMCPToolSelection(["mcp__docs_search"]);
+		session.appendDiscoveredBuiltinToolSelection(["search_tool_bm25"]);
+		let context = session.buildSessionContext();
+		expect(context.selectedMCPToolNames).toEqual(["mcp__docs_search"]);
+		expect(context.selectedDiscoveredBuiltinToolNames).toEqual(["search_tool_bm25"]);
+		expect(context.hasPersistedMCPToolSelection).toBe(true);
+		expect(context.hasPersistedDiscoveredBuiltinToolSelection).toBe(true);
 
-		session.appendMCPToolSelection(["mcp__docs_search"], []);
-		expect(session.buildSessionContext().selectedDiscoveredBuiltinToolNames).toEqual([]);
+		session.appendDiscoveredBuiltinToolSelection([]);
+		context = session.buildSessionContext();
+		expect(context.selectedMCPToolNames).toEqual(["mcp__docs_search"]);
+		expect(context.selectedDiscoveredBuiltinToolNames).toEqual([]);
 	});
 
 	it("keeps the prior built-in selection when a later legacy envelope omits the field", () => {

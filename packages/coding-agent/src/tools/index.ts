@@ -216,6 +216,8 @@ export interface ToolSession {
 	cwd: string;
 	/** Whether UI is available */
 	hasUI: boolean;
+	/** Whether this session will bind a workflow-gate emitter after tool construction. */
+	workflowGateEligible?: boolean;
 	/** Skip Python kernel availability check and warmup */
 	skipPythonPreflight?: boolean;
 	/** Pre-loaded context files (AGENTS.md, etc) */

@@ -4247,6 +4247,29 @@ export function createNotificationsExtension(
 		await controller.reconcileCurrentSession(ctx);
 	});
 
+	// Startup is optional unless a lifecycle request explicitly owns it. Branch and
+	// switch commit session identity independently, so observe optional startup and
+	// reconcile only after it has made the runtime reachable.
+	const reconcileBackgroundStartup = (
+		id: string,
+		ctx: ExtensionContext,
+		startup: Promise<SessionStartResult>,
+	): void => {
+		void startup
+			.then(async result => {
+				if (
+					result.status !== "started" ||
+					extensionShuttingDown ||
+					sessionId(ctx) !== id ||
+					activeRuntimeId !== id ||
+					!runtimes.has(id)
+				)
+					return;
+				await controller.reconcileCurrentSession(ctx);
+			})
+			.catch(error => logger.warn(`notifications: deferred startup reconciliation failed: ${String(error)}`));
+	};
+
 	// A session endpoint's token and generation are authority for exactly one
 	// session id. `/new`, fork, and resume must all tear down A before publishing
 	// B. Chat implementations may preserve a topic as metadata, but it must never
@@ -4258,6 +4281,17 @@ export function createNotificationsExtension(
 		if (extensionShuttingDown) return;
 		const newId = sessionId(ctx);
 		const prevId = activeRuntimeId ?? sessionIdFromFile(event.previousSessionFile);
+		if (prevId === newId) {
+			const pendingStartup = sessionStartPromises.get(newId);
+			if (pendingStartup) {
+				reconcileBackgroundStartup(newId, ctx, pendingStartup);
+				return;
+			}
+			if (runtimes.has(newId)) {
+				await controller.reconcileCurrentSession(ctx);
+				return;
+			}
+		}
 		if (prevId && prevId !== newId) {
 			controller.rekeySession(prevId, newId);
 			try {
@@ -4271,12 +4305,17 @@ export function createNotificationsExtension(
 			}
 		}
 		if (extensionShuttingDown) return;
-		await startSession(ctx);
-		if (extensionShuttingDown) {
-			await stopSession(newId);
+		const startup = startSession(ctx);
+		if (lifecycleStartupCapability) {
+			await startup;
+			if (extensionShuttingDown) {
+				await stopSession(newId);
+				return;
+			}
+			await controller.reconcileCurrentSession(ctx);
 			return;
 		}
-		await controller.reconcileCurrentSession(ctx);
+		reconcileBackgroundStartup(newId, ctx, startup);
 	};
 	api.on("session_switch", async (event, ctx) => {
 		if (identityControlInFlight) {

@@ -192,7 +192,14 @@ function alive(pid: number): boolean {
 		return (e as NodeJS.ErrnoException).code === "EPERM";
 	}
 }
+
+interface SessionIndexOpenGroup {
+	indexes: Set<SessionIndex>;
+	promise: Promise<void>;
+	closed: boolean;
+}
 export class SessionIndex {
+	static #openGroups = new Map<string, SessionIndexOpenGroup>();
 	#agentDir: string;
 	#events: SessionIndexEvent[] = [];
 	#warnings: string[] = [];
@@ -202,10 +209,34 @@ export class SessionIndex {
 		this.#agentDir = agentDir;
 	}
 	async open(): Promise<this> {
-		await fs.mkdir(dirFor(this.#agentDir), { recursive: true, mode: 0o700 });
-		await fs.chmod(dirFor(this.#agentDir), 0o700);
-		await withFileLock(logFor(this.#agentDir), () => this.replay());
+		const indexPath = path.resolve(logFor(this.#agentDir));
+		let group = SessionIndex.#openGroups.get(indexPath);
+		if (!group || group.closed) {
+			group = { indexes: new Set(), promise: Promise.resolve(), closed: false };
+			SessionIndex.#openGroups.set(indexPath, group);
+			group.promise = this.#openGroup(indexPath, group);
+		}
+		group.indexes.add(this);
+		await group.promise;
 		return this;
+	}
+	async #openGroup(indexPath: string, group: SessionIndexOpenGroup): Promise<void> {
+		try {
+			await fs.mkdir(dirFor(this.#agentDir), { recursive: true, mode: 0o700 });
+			await fs.chmod(dirFor(this.#agentDir), 0o700);
+			await withFileLock(logFor(this.#agentDir), async () => {
+				while (group.indexes.size > 0) {
+					const indexes = [...group.indexes];
+					group.indexes.clear();
+					await Promise.all(indexes.map(index => index.replay()));
+				}
+				group.closed = true;
+				if (SessionIndex.#openGroups.get(indexPath) === group) SessionIndex.#openGroups.delete(indexPath);
+			});
+		} finally {
+			group.closed = true;
+			if (SessionIndex.#openGroups.get(indexPath) === group) SessionIndex.#openGroups.delete(indexPath);
+		}
 	}
 	async replay(): Promise<void> {
 		const scan = await this.#scan();

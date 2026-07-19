@@ -1,4 +1,4 @@
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, expect, test, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -9,6 +9,7 @@ import type { ExtensionRunner } from "../src/extensibility/extensions/runner";
 import { getTelegramFileSink } from "../src/sdk/bus/attachment-registry";
 import { createNotificationsExtension } from "../src/sdk/bus/index";
 import { readEndpoint } from "../src/sdk/bus/telegram-reference";
+import { SessionSdkHost } from "../src/sdk/host";
 import { AgentSession } from "../src/session/agent-session";
 import { AuthStorage } from "../src/session/auth-storage";
 import { SessionManager } from "../src/session/session-manager";
@@ -37,6 +38,15 @@ async function waitFor(pred: () => boolean, ms = 4000, label = "condition"): Pro
 		await sleep(25);
 	}
 	throw new Error(`timed out waiting for ${label}`);
+}
+
+function deferred<T = void>(): {
+	promise: Promise<T>;
+	resolve(value: T | PromiseLike<T>): void;
+	reject(reason?: unknown): void;
+} {
+	const result = Promise.withResolvers<T>();
+	return { promise: result.promise, resolve: result.resolve, reject: result.reject };
 }
 
 type Handler = (event: unknown, ctx: unknown) => unknown;
@@ -469,6 +479,93 @@ test("session_branch rotates endpoint authority", async () => {
 		);
 		await waitFor(() => fs.existsSync(harness.endpoint()), 4000, "branched endpoint");
 		expect(fs.existsSync(originalEndpoint)).toBe(false);
+	});
+}, 30000);
+
+test("session_branch with the same id does not await optional startup and reconciles after it settles", async () => {
+	await withNotifications(async () => {
+		const entered = deferred();
+		const release = deferred();
+		const hostStart = SessionSdkHost.prototype.start;
+		let delayed = true;
+		const startSpy = vi.spyOn(SessionSdkHost.prototype, "start").mockImplementation(async function (
+			this: SessionSdkHost,
+		) {
+			if (delayed) {
+				delayed = false;
+				entered.resolve();
+				await release.promise;
+			}
+			return await hostStart.call(this);
+		});
+		const harness = createHarness("gjc-notif-branch-same-pending-");
+		try {
+			const startup = harness.handlers.get("session_start")!({ type: "session_start" }, harness.ctx);
+			await entered.promise;
+
+			let branchSettled = false;
+			const branch = Promise.resolve(
+				harness.handlers.get("session_branch")!(
+					{ type: "session_branch", previousSessionFile: harness.previousSessionFile(harness.sid) },
+					harness.ctx,
+				),
+			).then(() => {
+				branchSettled = true;
+			});
+			await Promise.resolve();
+			await Promise.resolve();
+			expect(branchSettled).toBe(true);
+
+			release.resolve();
+			await startup;
+			await branch;
+			await waitFor(() => fs.existsSync(harness.endpoint()), 4000, "same-id endpoint after startup");
+			await harness.handlers.get("session_shutdown")!({ type: "session_shutdown" }, harness.ctx);
+			expect(fs.existsSync(harness.endpoint())).toBe(false);
+		} finally {
+			release.resolve();
+			startSpy.mockRestore();
+		}
+	});
+}, 30000);
+
+test("session_branch to a new id does not await optional startup and disposes it after it settles", async () => {
+	await withNotifications(async () => {
+		const entered = deferred();
+		const release = deferred();
+		const hostStart = SessionSdkHost.prototype.start;
+		const startSpy = vi.spyOn(SessionSdkHost.prototype, "start").mockImplementation(async function (
+			this: SessionSdkHost,
+		) {
+			entered.resolve();
+			await release.promise;
+			return await hostStart.call(this);
+		});
+		const harness = createHarness("gjc-notif-branch-new-pending-");
+		try {
+			const previousId = `previous-${harness.sid}`;
+			let branchSettled = false;
+			const branch = Promise.resolve(
+				harness.handlers.get("session_branch")!(
+					{ type: "session_branch", previousSessionFile: harness.previousSessionFile(previousId) },
+					harness.ctx,
+				),
+			).then(() => {
+				branchSettled = true;
+			});
+			await entered.promise;
+			await Promise.resolve();
+			await Promise.resolve();
+			expect(branchSettled).toBe(true);
+
+			await harness.handlers.get("session_shutdown")!({ type: "session_shutdown" }, harness.ctx);
+			release.resolve();
+			await branch;
+			await waitFor(() => !fs.existsSync(harness.endpoint()), 4000, "new-id endpoint removed after startup");
+		} finally {
+			release.resolve();
+			startSpy.mockRestore();
+		}
 	});
 }, 30000);
 

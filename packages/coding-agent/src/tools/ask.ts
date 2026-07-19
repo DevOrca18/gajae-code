@@ -986,7 +986,9 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
 	}
 
 	static createIf(session: ToolSession): AskTool | null {
-		return session.hasUI || session.getWorkflowGateEmitter?.() ? new AskTool(session) : null;
+		return session.hasUI || session.workflowGateEligible || session.getWorkflowGateEmitter?.()
+			? new AskTool(session)
+			: null;
 	}
 
 	/** Send terminal notification when ask tool is waiting for input */

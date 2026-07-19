@@ -109,7 +109,7 @@ describe("createAgentSession defaultInactive tool activation", () => {
 			content: "before selection-only activation",
 			timestamp: Date.now(),
 		});
-		sessionManager.appendMCPToolSelection([], ["find"]);
+		sessionManager.appendDiscoveredBuiltinToolSelection(["find"]);
 		const { session } = await createMinimalSession(
 			tempDirs,
 			Settings.isolated({ "tools.discoveryMode": "all", "tools.essentialOverride": ["read", "bash", "edit"] }),
@@ -137,7 +137,7 @@ describe("createAgentSession defaultInactive tool activation", () => {
 			content: "before selection",
 			timestamp: Date.now(),
 		});
-		sessionManager.appendMCPToolSelection([], ["find"]);
+		sessionManager.appendDiscoveredBuiltinToolSelection(["find"]);
 		const { session } = await createMinimalSession(
 			tempDirs,
 			Settings.isolated({ "tools.discoveryMode": "all" }),
