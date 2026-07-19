@@ -949,10 +949,7 @@ describe("AgentSession MCP discovery", () => {
 		expect(session.getSelectedMCPToolNames()).toEqual(["mcp__docs_search", "mcp__slack_send_message"]);
 		expect(session.getActiveToolNames()).toEqual(["read", "mcp__docs_search", "mcp__slack_send_message"]);
 		expect(session.systemPrompt).toEqual(["tools:read,mcp__docs_search,mcp__slack_send_message"]);
-		expect(sessionManager.buildSessionContext().selectedMCPToolNames).toEqual([
-			"mcp__docs_search",
-			"mcp__slack_send_message",
-		]);
+		expect(sessionManager.buildSessionContext().selectedMCPToolNames).toEqual([]);
 	});
 
 	it("clears discovered MCP selections when starting a brand-new session", async () => {

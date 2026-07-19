@@ -2184,11 +2184,12 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			];
 			initialSelectedMCPToolNames = existingSession.hasPersistedMCPToolSelection
 				? restoredSelectedMCPToolNames
-				: [...new Set([...defaultSelectedMCPToolNames, ...explicitlyRequestedMCPToolNames])];
+				: hasExplicitToolNames
+					? explicitlyRequestedMCPToolNames
+					: defaultSelectedMCPToolNames;
 			initialToolNames = [
 				...new Set([
 					...initialRequestedActiveToolNames.filter(name => !discoverableMCPToolNames.has(name)),
-					...defaultSelectedMCPToolNames,
 					...initialSelectedMCPToolNames,
 				]),
 			];
@@ -2541,6 +2542,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			mcpDiscoveryEnabled,
 			discoveryMode: effectiveDiscoveryMode,
 			initialSelectedMCPToolNames,
+			initialMCPToolSelectionIsExplicit: hasExplicitToolNames,
+			initialDiscoveredBuiltinToolSelectionIsExplicit: hasExplicitToolNames,
 			initialSelectedDiscoveredBuiltinToolNames,
 			initialBaselineDiscoveredBuiltinToolNames,
 			defaultSelectedMCPToolNames,
