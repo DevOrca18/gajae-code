@@ -4,6 +4,7 @@ export function getExtraHelpText(): string {
 	return `Commands:
   ${APP_NAME} [prompt]             - Start an interactive coding session (default launch command)
   ${APP_NAME} launch               - Start an explicit launch/session workflow
+  ${APP_NAME} memory               - Operate the opt-in filesystem/MAP memory protocol
   ${APP_NAME} setup                - Install GJC defaults or optional dependencies
   ${APP_NAME} session              - List, inspect, create, remove, or attach sessions
   ${APP_NAME} state                - Inspect or manage persisted GJC state

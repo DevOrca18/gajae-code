@@ -47,6 +47,7 @@ describe("GJC public CLI command surface", () => {
 			"plugin",
 			"completion",
 			"launch",
+			"memory",
 		]);
 	});
 
@@ -101,6 +102,18 @@ describe("GJC public CLI command surface", () => {
 			await fs.rm(stageDir, { recursive: true, force: true });
 		}
 	}, 60_000);
+
+	it("lists the public memory command in root help", () => {
+		const result = Bun.spawnSync(["bun", cliEntry, "--help"], {
+			cwd: repoRoot,
+			stderr: "pipe",
+			stdout: "pipe",
+		});
+		const output = `${result.stdout.toString()}\n${result.stderr.toString()}`;
+		expect(result.exitCode, output).toBe(0);
+		expect(output).toContain("gjc memory");
+		expect(output).toContain("opt-in filesystem/MAP memory protocol");
+	}, 30_000);
 
 	it("exposes the update command help without launching the TUI", () => {
 		const result = Bun.spawnSync(["bun", cliEntry, "update", "--help"], {
