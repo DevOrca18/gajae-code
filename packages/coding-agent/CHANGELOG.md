@@ -6,6 +6,8 @@
 
 ### Fixed
 - Malformed selectors on internal read URLs now fail explicitly instead of silently falling back to an unbounded resource read.
+- Newly registered earlier resource-GC policies advance the pending sweep without postponing an already earlier sweep.
+- Provider onboarding wizard completion is now deterministic under CI load: duplicate in-flight confirmation is suppressed, success tests await the real refresh/notification/status boundary instead of fixed sleeps, and the newly configured model is verified through the subsequent model selector.
 
 ### Fixed
 - Activated discoverable built-in tools now persist with session discovery selections and are restored on the first resumed turn and during session-context navigation, while removed, disallowed, essential, and non-discoverable tools remain filtered out.
