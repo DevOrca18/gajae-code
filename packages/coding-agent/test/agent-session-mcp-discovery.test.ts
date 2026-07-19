@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -93,6 +93,7 @@ describe("AgentSession MCP discovery", () => {
 		for (const tempDir of tempDirs.splice(0)) {
 			fs.rmSync(tempDir, { recursive: true, force: true });
 		}
+		vi.restoreAllMocks();
 	});
 
 	it("caches discoverable MCP search indexes until MCP tools refresh", async () => {
@@ -366,6 +367,77 @@ describe("AgentSession MCP discovery", () => {
 		expect(session.getSelectedMCPToolNames()).toEqual(["mcp__docs_search", "mcp__slack_send_message"]);
 		expect(session.getActiveToolNames()).toEqual(["read", "mcp__docs_search", "mcp__slack_send_message"]);
 		expect(session.systemPrompt).toEqual(["tools:read,mcp__docs_search,mcp__slack_send_message"]);
+	});
+
+	it("persists mixed discovery activations as one combined selection envelope", async () => {
+		const readTool = createBasicTool("read", "Read");
+		const docsSearchTool = createMcpTool("mcp__docs_search", "docs", "search", "Search internal docs", ["query"]);
+		const searchTool = createBasicTool("search", "Search");
+		searchTool.loadMode = "discoverable";
+		const findTool = createBasicTool("find", "Find");
+		findTool.loadMode = "discoverable";
+		const toolRegistry = new Map([
+			[readTool.name, readTool],
+			[docsSearchTool.name, docsSearchTool],
+			[searchTool.name, searchTool],
+			[findTool.name, findTool],
+		]);
+		const sessionManager = SessionManager.inMemory();
+		const agent = new Agent({
+			initialState: {
+				model: createModel(),
+				systemPrompt: ["initial"],
+				tools: [readTool],
+				messages: [],
+			},
+		});
+		const session = new AgentSession({
+			agent,
+			sessionManager,
+			settings: Settings.isolated({ "tools.discoveryMode": "all" }),
+			modelRegistry: {} as never,
+			toolRegistry,
+			mcpDiscoveryEnabled: true,
+			rebuildSystemPrompt: async toolNames => ({
+				systemPrompt: [`tools:${toolNames.join(",")}`],
+			}),
+		});
+		sessions.push(session);
+		const setToolsSpy = vi.spyOn(agent, "setTools");
+		const setToolsCallsBeforeMixedActivation = setToolsSpy.mock.calls.length;
+
+		const entriesBeforeMixedActivation = sessionManager.getBranch().length;
+		expect(await session.activateDiscoveredTools(["mcp__docs_search", "search"])).toEqual([
+			"mcp__docs_search",
+			"search",
+		]);
+		expect(setToolsSpy.mock.calls.length - setToolsCallsBeforeMixedActivation).toBe(1);
+
+		const mixedSelectionEntries = sessionManager
+			.getBranch()
+			.slice(entriesBeforeMixedActivation)
+			.filter(entry => entry.type === "mcp_tool_selection");
+		expect(mixedSelectionEntries).toHaveLength(1);
+		expect(mixedSelectionEntries[0]?.selectedToolNames).toEqual(["mcp__docs_search"]);
+		expect(mixedSelectionEntries[0]?.selectedDiscoveredBuiltinToolNames).toEqual(["search"]);
+		expect(
+			sessionManager
+				.getBranch()
+				.slice(entriesBeforeMixedActivation)
+				.filter(entry => entry.type === "custom" && entry.customType === "discovered_builtin_tool_selection"),
+		).toHaveLength(0);
+		expect(sessionManager.buildSessionContext().selectedMCPToolNames).toEqual(["mcp__docs_search"]);
+		expect(sessionManager.buildSessionContext().selectedDiscoveredBuiltinToolNames).toEqual(["search"]);
+
+		const entriesBeforeBuiltinOnlyActivation = sessionManager.getBranch().length;
+		expect(await session.activateDiscoveredTools(["find"])).toEqual(["find"]);
+		const builtinOnlySelectionEntries = sessionManager.getBranch().slice(entriesBeforeBuiltinOnlyActivation);
+		expect(builtinOnlySelectionEntries.filter(entry => entry.type === "mcp_tool_selection")).toHaveLength(0);
+		expect(
+			builtinOnlySelectionEntries.filter(
+				entry => entry.type === "custom" && entry.customType === "discovered_builtin_tool_selection",
+			),
+		).toHaveLength(1);
 	});
 	it("reapplies default MCP server baselines when refreshed tools reconnect", async () => {
 		const readTool = createBasicTool("read", "Read");

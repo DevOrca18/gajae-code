@@ -330,6 +330,19 @@ export interface MCPToolSelectionEntry extends SessionEntryBase {
 	selectedDiscoveredBuiltinToolNames?: string[];
 }
 
+/** Custom envelope type used when only built-in discovery selection changes. */
+export const DISCOVERED_BUILTIN_TOOL_SELECTION_CUSTOM_TYPE = "discovered_builtin_tool_selection";
+
+export interface DiscoveredBuiltinToolSelectionData {
+	selectedDiscoveredBuiltinToolNames: string[];
+}
+
+function isDiscoveredBuiltinToolSelectionData(value: unknown): value is DiscoveredBuiltinToolSelectionData {
+	if (!value || typeof value !== "object") return false;
+	const selectedToolNames = (value as Record<string, unknown>).selectedDiscoveredBuiltinToolNames;
+	return Array.isArray(selectedToolNames) && selectedToolNames.every(name => typeof name === "string");
+}
+
 /** Session init entry - captures initial context for subagent sessions (debugging/replay). */
 export interface SessionInitEntry extends SessionEntryBase {
 	type: "session_init";
@@ -1061,6 +1074,12 @@ export function buildSessionContext(
 				selectedDiscoveredBuiltinToolNames = [...entry.selectedDiscoveredBuiltinToolNames];
 			}
 			hasPersistedMCPToolSelection = true;
+		} else if (
+			entry.type === "custom" &&
+			entry.customType === DISCOVERED_BUILTIN_TOOL_SELECTION_CUSTOM_TYPE &&
+			isDiscoveredBuiltinToolSelectionData(entry.data)
+		) {
+			selectedDiscoveredBuiltinToolNames = [...entry.data.selectedDiscoveredBuiltinToolNames];
 		} else if (entry.type === "mode_change") {
 			mode = entry.mode;
 			modeData = entry.data;
@@ -1466,7 +1485,12 @@ function hasStrictSessionSchema(entries: FileEntry[]): boolean {
 				if (typeof value.fromId !== "string" || typeof value.summary !== "string") return false;
 				break;
 			case "custom":
-				if (typeof value.customType !== "string") return false;
+				if (
+					typeof value.customType !== "string" ||
+					(value.customType === DISCOVERED_BUILTIN_TOOL_SELECTION_CUSTOM_TYPE &&
+						!isDiscoveredBuiltinToolSelectionData(value.data))
+				)
+					return false;
 				break;
 			case "custom_message":
 				if (
@@ -5477,6 +5501,20 @@ export class SessionManager {
 			...(selectedDiscoveredBuiltinToolNames
 				? { selectedDiscoveredBuiltinToolNames: [...selectedDiscoveredBuiltinToolNames] }
 				: {}),
+		};
+		this.#appendEntry(entry);
+		return entry.id;
+	}
+
+	/** Append a built-in-only discovery selection envelope that legacy readers ignore. */
+	appendDiscoveredBuiltinToolSelection(selectedDiscoveredBuiltinToolNames: string[]): string {
+		const entry: CustomEntry<DiscoveredBuiltinToolSelectionData> = {
+			type: "custom",
+			customType: DISCOVERED_BUILTIN_TOOL_SELECTION_CUSTOM_TYPE,
+			data: { selectedDiscoveredBuiltinToolNames: [...selectedDiscoveredBuiltinToolNames] },
+			id: generateId(this.#byId),
+			parentId: this.#leafId,
+			timestamp: new Date().toISOString(),
 		};
 		this.#appendEntry(entry);
 		return entry.id;

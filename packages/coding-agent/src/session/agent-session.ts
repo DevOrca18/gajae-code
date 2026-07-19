@@ -2144,17 +2144,23 @@ export class AgentSession {
 			config.persistInitialMCPToolSelection ?? this.sessionManager.getBranch().length === 0;
 		if (
 			(this.#mcpDiscoveryEnabled || this.#resolveEffectiveDiscoveryMode() === "all") &&
-			persistInitialMCPToolSelection &&
-			(!this.#selectedMCPToolNamesMatch(persistedSelectedMCPToolNames, currentSelectedMCPToolNames) ||
-				!this.#selectedMCPToolNamesMatch(
-					persistedSelectedDiscoveredBuiltinToolNames ?? [],
-					currentSelectedDiscoveredBuiltinToolNames,
-				))
+			persistInitialMCPToolSelection
 		) {
-			this.sessionManager.appendMCPToolSelection(
+			const mcpSelectionChanged = !this.#selectedMCPToolNamesMatch(
+				persistedSelectedMCPToolNames,
 				currentSelectedMCPToolNames,
+			);
+			const builtinSelectionChanged = !this.#selectedMCPToolNamesMatch(
+				persistedSelectedDiscoveredBuiltinToolNames ?? [],
 				currentSelectedDiscoveredBuiltinToolNames,
 			);
+			if (mcpSelectionChanged || builtinSelectionChanged) {
+				this.#appendDiscoveryToolSelection(
+					currentSelectedMCPToolNames,
+					currentSelectedDiscoveredBuiltinToolNames,
+					mcpSelectionChanged,
+				);
+			}
 		}
 		this.#rememberSessionDefaultSelectedMCPToolNames(
 			this.sessionManager.getSessionFile(),
@@ -5160,7 +5166,23 @@ export class AgentSession {
 		) {
 			return;
 		}
-		this.sessionManager.appendMCPToolSelection(nextSelectedMCPToolNames, nextSelectedDiscoveredBuiltinToolNames);
+		this.#appendDiscoveryToolSelection(
+			nextSelectedMCPToolNames,
+			nextSelectedDiscoveredBuiltinToolNames,
+			!this.#selectedMCPToolNamesMatch(previousSelectedMCPToolNames, nextSelectedMCPToolNames),
+		);
+	}
+
+	#appendDiscoveryToolSelection(
+		selectedMCPToolNames: string[],
+		selectedDiscoveredBuiltinToolNames: string[],
+		mcpSelectionChanged: boolean,
+	): void {
+		if (mcpSelectionChanged) {
+			this.sessionManager.appendMCPToolSelection(selectedMCPToolNames, selectedDiscoveredBuiltinToolNames);
+		} else {
+			this.sessionManager.appendDiscoveredBuiltinToolSelection(selectedDiscoveredBuiltinToolNames);
+		}
 	}
 
 	#getActiveNonMCPToolNames(): string[] {
@@ -5344,27 +5366,6 @@ export class AgentSession {
 		return this.#filterSelectableMCPToolNames(this.#selectedMCPToolNames);
 	}
 
-	async #activateDiscoveredMCPTools(toolNames: string[]): Promise<string[]> {
-		const nextSelectedMCPToolNames = new Set(this.#selectedMCPToolNames);
-		const activated: string[] = [];
-		for (const name of toolNames) {
-			if (!this.#discoverableMCPTools.has(name) || !this.#toolRegistry.has(name)) {
-				continue;
-			}
-			nextSelectedMCPToolNames.add(name);
-			activated.push(name);
-		}
-		if (activated.length === 0) {
-			return [];
-		}
-		const nextActive = [
-			...this.#getActiveNonMCPToolNames(),
-			...this.#filterSelectableMCPToolNames(nextSelectedMCPToolNames),
-		];
-		await this.setActiveToolsByName(nextActive);
-		return [...new Set(activated)];
-	}
-
 	// ── Generic tool discovery (covers built-in + MCP + extension) ────────────
 
 	#resolveEffectiveDiscoveryMode(): "off" | "mcp-only" | "all" {
@@ -5410,50 +5411,49 @@ export class AgentSession {
 		return this.#discoverableToolSearchIndex;
 	}
 
-	/** Invalidate the generic search index cache (call after tool set changes).
-	 *  Delegates to {@link #invalidateDiscoveryCaches} so all discovery-related caches stay in sync. */
-	#invalidateDiscoverableToolSearchIndex(): void {
-		this.#invalidateDiscoveryCaches();
-	}
-
 	getSelectedDiscoveredToolNames(): string[] {
 		const mcpSelected = this.getSelectedMCPToolNames();
 		return [...new Set([...mcpSelected, ...this.#getSelectedDiscoveredBuiltinToolNames()])];
 	}
 
 	async activateDiscoveredTools(toolNames: string[]): Promise<string[]> {
-		const mcpNames = toolNames.filter(name => this.#discoverableMCPTools.has(name));
-		const nonMcpNames = toolNames.filter(name => !this.#discoverableMCPTools.has(name));
-		const activated: string[] = [];
+		const previousSelectedMCPToolNames = this.getSelectedMCPToolNames();
+		const previousSelectedDiscoveredBuiltinToolNames = this.#getSelectedDiscoveredBuiltinToolNames();
+		const nextSelectedMCPToolNames = new Set(this.#selectedMCPToolNames);
+		const currentActiveNames = new Set(this.getActiveToolNames());
+		const activatedMCPToolNames: string[] = [];
+		const activatedDiscoveredBuiltinToolNames: string[] = [];
 
-		// Activate MCP tools via existing path
-		if (mcpNames.length > 0) {
-			const activatedMcp = await this.#activateDiscoveredMCPTools(mcpNames);
-			activated.push(...activatedMcp);
+		for (const name of toolNames) {
+			if (!this.#discoverableMCPTools.has(name)) continue;
+			if (!this.#toolRegistry.has(name)) continue;
+			nextSelectedMCPToolNames.add(name);
+			activatedMCPToolNames.push(name);
+		}
+		for (const name of toolNames) {
+			if (this.#discoverableMCPTools.has(name)) continue;
+			if (this.#discoverableToolAllowedNames && !this.#discoverableToolAllowedNames.has(name)) continue;
+			const tool = this.#toolRegistry.get(name);
+			if (tool?.loadMode !== "discoverable" || currentActiveNames.has(name)) continue;
+			activatedDiscoveredBuiltinToolNames.push(name);
+		}
+		if (activatedMCPToolNames.length === 0 && activatedDiscoveredBuiltinToolNames.length === 0) {
+			return [];
 		}
 
-		// Activate built-ins that are discoverable under the current all-discovery configuration.
-		if (nonMcpNames.length > 0) {
-			const previousSelectedDiscoveredBuiltinToolNames = this.#getSelectedDiscoveredBuiltinToolNames();
-			const currentActiveNames = new Set(this.getActiveToolNames());
-			const newlyAdded: string[] = [];
-			for (const name of nonMcpNames) {
-				if (this.#discoverableToolAllowedNames && !this.#discoverableToolAllowedNames.has(name)) continue;
-				const tool = this.#toolRegistry.get(name);
-				if (tool?.loadMode === "discoverable" && !currentActiveNames.has(name)) {
-					newlyAdded.push(name);
-					this.#selectedDiscoveredToolNames.add(name);
-					activated.push(name);
-				}
-			}
-			if (newlyAdded.length > 0) {
-				const nextActive = [...this.getActiveToolNames(), ...newlyAdded];
-				await this.#applyActiveToolsByName(nextActive, { previousSelectedDiscoveredBuiltinToolNames });
-				this.#invalidateDiscoverableToolSearchIndex();
-			}
+		for (const name of activatedDiscoveredBuiltinToolNames) {
+			this.#selectedDiscoveredToolNames.add(name);
 		}
-
-		return [...new Set(activated)];
+		const nextActive = [
+			...this.#getActiveNonMCPToolNames(),
+			...activatedDiscoveredBuiltinToolNames,
+			...this.#filterSelectableMCPToolNames(nextSelectedMCPToolNames),
+		];
+		await this.#applyActiveToolsByName(nextActive, {
+			previousSelectedMCPToolNames,
+			previousSelectedDiscoveredBuiltinToolNames,
+		});
+		return [...new Set([...activatedMCPToolNames, ...activatedDiscoveredBuiltinToolNames])];
 	}
 
 	/** Wrap guarded tools so SDK permission modes remain fail-closed without a reverse provider. */
@@ -8706,7 +8706,11 @@ export class AgentSession {
 			const selectedMCPToolNames = this.getSelectedMCPToolNames();
 			const selectedDiscoveredBuiltinToolNames = this.#getSelectedDiscoveredBuiltinToolNames();
 			if (selectedMCPToolNames.length > 0 || selectedDiscoveredBuiltinToolNames.length > 0) {
-				this.sessionManager.appendMCPToolSelection(selectedMCPToolNames, selectedDiscoveredBuiltinToolNames);
+				this.#appendDiscoveryToolSelection(
+					selectedMCPToolNames,
+					selectedDiscoveredBuiltinToolNames,
+					selectedMCPToolNames.length > 0,
+				);
 			}
 		}
 		this.#rememberSessionDefaultSelectedMCPToolNames(

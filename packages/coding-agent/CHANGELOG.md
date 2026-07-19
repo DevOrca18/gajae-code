@@ -3,8 +3,6 @@
 ## [Unreleased]
 ### Fixed
 - Added evidence-preserving recovery for legacy multi-writer SDK session-index corruption: `gjc gc` now diagnoses corrupt prefixes, `--repair-session-index` quarantines the original snapshot/log under the session-index lock before atomically restoring only the checksum-valid monotonic prefix, and append failures point operators to the explicit repair path (#2654).
-
-### Fixed
 - Malformed selectors on internal read URLs now fail explicitly instead of silently falling back to an unbounded resource read.
 - Newly registered earlier resource-GC policies advance the pending sweep without postponing an already earlier sweep.
 

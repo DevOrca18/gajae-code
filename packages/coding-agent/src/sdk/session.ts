@@ -2153,6 +2153,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		let initialSelectedMCPToolNames: string[] = [];
 		let defaultSelectedMCPToolNames: string[] = [];
 		let initialBaselineDiscoveredBuiltinToolNames: string[] = [];
+		let initialSelectedDiscoveredBuiltinToolNames: string[] = [];
 		if (mcpDiscoveryEnabled) {
 			const defaultServerNames = new Set(settings.get("mcp.discoveryDefaultServers") ?? []);
 			for (const tool of toolRegistry.values()) {
@@ -2225,12 +2226,12 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				toolRegistry,
 				allowedDiscoveredBuiltinNames,
 			);
-			const restoredDiscoveredNames = selectRestorableDiscoveredBuiltinToolNames(
+			initialSelectedDiscoveredBuiltinToolNames = selectRestorableDiscoveredBuiltinToolNames(
 				existingSession.selectedDiscoveredBuiltinToolNames ?? [],
 				toolRegistry,
 				allowedDiscoveredBuiltinNames,
 			);
-			initialToolNames = [...new Set([...baselineInitialToolNames, ...restoredDiscoveredNames])];
+			initialToolNames = [...new Set([...baselineInitialToolNames, ...initialSelectedDiscoveredBuiltinToolNames])];
 		}
 
 		// Pre-register in the global agent registry BEFORE building the system prompt,
@@ -2531,16 +2532,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			mcpDiscoveryEnabled,
 			discoveryMode: effectiveDiscoveryMode,
 			initialSelectedMCPToolNames,
-			initialSelectedDiscoveredBuiltinToolNames:
-				effectiveDiscoveryMode === "all"
-					? selectRestorableDiscoveredBuiltinToolNames(
-							existingSession.selectedDiscoveredBuiltinToolNames ?? [],
-							toolRegistry,
-							options.discoverableToolAllowedNames
-								? new Set(options.discoverableToolAllowedNames.map(name => name.toLowerCase()))
-								: undefined,
-						)
-					: [],
+			initialSelectedDiscoveredBuiltinToolNames,
 			initialBaselineDiscoveredBuiltinToolNames,
 			defaultSelectedMCPToolNames,
 			persistInitialMCPToolSelection: !hasExistingSession,

@@ -15,13 +15,27 @@ function builtin(name: string, loadMode: "discoverable" | "essential" | "none" =
 }
 
 describe("discovered built-in tool persistence", () => {
-	it("round-trips selected built-ins independently from MCP selections and supports explicit clearing", () => {
+	it("persists built-in-only selections in an old-reader-safe custom envelope", () => {
+		const session = SessionManager.inMemory();
+		session.appendDiscoveredBuiltinToolSelection(["search_tool_bm25"]);
+
+		const context = session.buildSessionContext();
+		expect(context.selectedDiscoveredBuiltinToolNames).toEqual(["search_tool_bm25"]);
+		expect(context.hasPersistedMCPToolSelection).toBe(false);
+
+		session.appendDiscoveredBuiltinToolSelection([]);
+		expect(session.buildSessionContext().selectedDiscoveredBuiltinToolNames).toEqual([]);
+	});
+
+	it("keeps combined MCP and built-in selection changes atomic", () => {
 		const session = SessionManager.inMemory();
 		session.appendMCPToolSelection(["mcp__docs_search"], ["search_tool_bm25"]);
-		expect(session.buildSessionContext().selectedDiscoveredBuiltinToolNames).toEqual(["search_tool_bm25"]);
 
-		session.appendMCPToolSelection(["mcp__docs_search"], []);
-		expect(session.buildSessionContext().selectedDiscoveredBuiltinToolNames).toEqual([]);
+		expect(session.buildSessionContext()).toMatchObject({
+			selectedMCPToolNames: ["mcp__docs_search"],
+			selectedDiscoveredBuiltinToolNames: ["search_tool_bm25"],
+			hasPersistedMCPToolSelection: true,
+		});
 	});
 
 	it("keeps the prior built-in selection when a later legacy envelope omits the field", () => {

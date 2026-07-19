@@ -450,6 +450,44 @@ describe("SessionManager read-only resume", () => {
 		});
 	});
 
+	it("rejects malformed built-in-only discovery selection envelopes", async () => {
+		const storage = new WriteTrackingStorage();
+		const filePath = "/sessions/malformed-built-in-only-selection.jsonl";
+		const header = {
+			type: "session",
+			id: "malformed-built-in-only-selection",
+			timestamp: new Date(0).toISOString(),
+			cwd: "/cwd",
+			version: 3,
+		};
+		const invalidEntry = {
+			type: "custom",
+			customType: "discovered_builtin_tool_selection",
+			id: "bad-built-in-selection",
+			parentId: null,
+			timestamp: new Date(0).toISOString(),
+			data: { selectedDiscoveredBuiltinToolNames: ["find", 42] },
+		};
+		storage.writeTextSync(filePath, `${JSON.stringify(header)}\n${JSON.stringify(invalidEntry)}\n`);
+		const stat = storage.statSync(filePath);
+		const identity: ResumeSessionIdentity = {
+			canonicalPath: filePath,
+			sessionId: "malformed-built-in-only-selection",
+			dev: stat.dev,
+			ino: stat.ino,
+			size: stat.size,
+			mtimeMs: stat.mtimeMs,
+			mtimeNs: stat.mtimeNs,
+			sha256: "ignored",
+		};
+
+		expectStrictFailure(await SessionManager.openExistingStrict(identity, "/sessions", storage), "malformed");
+		expect(await SessionManager.inspectSessionTailReadOnly(filePath, storage)).toEqual({
+			kind: "error",
+			reason: "malformed",
+		});
+	});
+
 	it("preserves inspected migration state until the first v4 persistence rewrite", async () => {
 		const storage = new WriteTrackingStorage();
 		const filePath = "/sessions/legacy-v2.jsonl";
