@@ -367,6 +367,62 @@ describe("AgentSession MCP discovery", () => {
 		expect(session.getActiveToolNames()).toEqual(["read", "mcp__docs_search", "mcp__slack_send_message"]);
 		expect(session.systemPrompt).toEqual(["tools:read,mcp__docs_search,mcp__slack_send_message"]);
 	});
+
+	it("persists mixed discovery activations with independent MCP and built-in authority", async () => {
+		const readTool = createBasicTool("read", "Read");
+		const docsSearchTool = createMcpTool("mcp__docs_search", "docs", "search", "Search internal docs", ["query"]);
+		const searchTool = createBasicTool("search", "Search");
+		searchTool.loadMode = "discoverable";
+		const findTool = createBasicTool("find", "Find");
+		findTool.loadMode = "discoverable";
+		const toolRegistry = new Map([
+			[readTool.name, readTool],
+			[docsSearchTool.name, docsSearchTool],
+			[searchTool.name, searchTool],
+			[findTool.name, findTool],
+		]);
+		const sessionManager = SessionManager.inMemory();
+		const agent = new Agent({
+			initialState: {
+				model: createModel(),
+				systemPrompt: ["initial"],
+				tools: [readTool],
+				messages: [],
+			},
+		});
+		const session = new AgentSession({
+			agent,
+			sessionManager,
+			settings: Settings.isolated({ "tools.discoveryMode": "all" }),
+			modelRegistry: {} as never,
+			toolRegistry,
+			mcpDiscoveryEnabled: true,
+			rebuildSystemPrompt: async toolNames => ({
+				systemPrompt: [`tools:${toolNames.join(",")}`],
+			}),
+		});
+		sessions.push(session);
+
+		const entriesBeforeMixedActivation = sessionManager.getBranch().length;
+		expect(await session.activateDiscoveredTools(["mcp__docs_search", "search"])).toEqual([
+			"mcp__docs_search",
+			"search",
+		]);
+
+		const mixedSelectionEntries = sessionManager.getBranch().slice(entriesBeforeMixedActivation);
+		expect(mixedSelectionEntries.filter(entry => entry.type === "mcp_tool_selection")).toHaveLength(1);
+		expect(mixedSelectionEntries.filter(entry => entry.type === "discovered_builtin_tool_selection")).toHaveLength(1);
+		expect(sessionManager.buildSessionContext().selectedMCPToolNames).toEqual(["mcp__docs_search"]);
+		expect(sessionManager.buildSessionContext().selectedDiscoveredBuiltinToolNames).toEqual(["search"]);
+
+		const entriesBeforeBuiltinOnlyActivation = sessionManager.getBranch().length;
+		expect(await session.activateDiscoveredTools(["find"])).toEqual(["find"]);
+		const builtinOnlySelectionEntries = sessionManager.getBranch().slice(entriesBeforeBuiltinOnlyActivation);
+		expect(builtinOnlySelectionEntries.filter(entry => entry.type === "mcp_tool_selection")).toHaveLength(0);
+		expect(
+			builtinOnlySelectionEntries.filter(entry => entry.type === "discovered_builtin_tool_selection"),
+		).toHaveLength(1);
+	});
 	it("reapplies default MCP server baselines when refreshed tools reconnect", async () => {
 		const readTool = createBasicTool("read", "Read");
 		const docsSearchTool = createMcpTool("mcp__docs_search", "docs", "search", "Search internal docs", ["query"]);

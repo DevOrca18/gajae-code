@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { getBundledModel } from "@gajae-code/ai";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
+import type { CustomTool } from "@gajae-code/coding-agent/extensibility/custom-tools/types";
 import { createAgentSession, type ExtensionFactory } from "@gajae-code/coding-agent/sdk";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
@@ -32,11 +33,26 @@ const toolActivationExtension: ExtensionFactory = pi => {
 	});
 };
 
+function createMcpCustomTool(name: string, serverName: string, mcpToolName: string): CustomTool {
+	return {
+		name,
+		label: `${serverName}/${mcpToolName}`,
+		description: `Tool ${mcpToolName} from ${serverName}`,
+		mcpServerName: serverName,
+		mcpToolName,
+		parameters: z.object({}),
+		async execute() {
+			return { content: [{ type: "text", text: name }] };
+		},
+	} as CustomTool;
+}
+
 async function createMinimalSession(
 	tempDirs: string[],
 	settings: Settings,
 	toolNames?: string[],
 	sessionManager = SessionManager.inMemory(),
+	customTools?: CustomTool[],
 ) {
 	const tempDir = path.join(os.tmpdir(), `pi-sdk-goal-tool-${Snowflake.next()}`);
 	tempDirs.push(tempDir);
@@ -56,6 +72,7 @@ async function createMinimalSession(
 		enableMCP: false,
 		enableLsp: false,
 		toolNames,
+		customTools,
 	});
 }
 
@@ -97,6 +114,32 @@ describe("createAgentSession defaultInactive tool activation", () => {
 		try {
 			expect(await session.activateDiscoveredTools(["find"])).toEqual(["find"]);
 			expect(sessionManager.buildSessionContext().selectedDiscoveredBuiltinToolNames).toEqual(["find"]);
+		} finally {
+			await session.dispose();
+		}
+	});
+
+	it("keeps configured MCP defaults when resuming a built-in-only selection", async () => {
+		const sessionManager = SessionManager.inMemory();
+		sessionManager.appendDiscoveredBuiltinToolSelection(["find"]);
+		const { session } = await createMinimalSession(
+			tempDirs,
+			Settings.isolated({
+				"mcp.discoveryMode": true,
+				"mcp.discoveryDefaultServers": ["docs"],
+				"tools.discoveryMode": "all",
+				"tools.essentialOverride": ["read", "bash", "edit"],
+			}),
+			undefined,
+			sessionManager,
+			[createMcpCustomTool("mcp__docs_search", "docs", "search")],
+		);
+
+		try {
+			expect(sessionManager.buildSessionContext().hasPersistedMCPToolSelection).toBe(false);
+			expect(session.getSelectedMCPToolNames()).toEqual(["mcp__docs_search"]);
+			expect(session.getActiveToolNames()).toContain("mcp__docs_search");
+			expect(session.getActiveToolNames()).toContain("find");
 		} finally {
 			await session.dispose();
 		}
