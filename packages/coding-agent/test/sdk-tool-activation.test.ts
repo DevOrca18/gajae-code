@@ -147,6 +147,43 @@ describe("createAgentSession defaultInactive tool activation", () => {
 		}
 	});
 
+	it("restores constructor selections rather than persisted startup selections in metadata-free history", async () => {
+		const sessionManager = SessionManager.inMemory();
+		const targetEntryId = sessionManager.appendMessage({
+			role: "user",
+			content: "before persisted tool selections",
+			timestamp: Date.now(),
+		});
+		sessionManager.appendMCPToolSelection(["mcp__persisted_search"]);
+		sessionManager.appendDiscoveredBuiltinToolSelection([]);
+		const { session } = await createMinimalSession(
+			tempDirs,
+			Settings.isolated({ "tools.discoveryMode": "all", "tools.essentialOverride": ["read", "bash", "edit"] }),
+			["read", "mcp__constructor_search", "find"],
+			sessionManager,
+			[
+				createMcpCustomTool("mcp__constructor_search", "constructor", "search"),
+				createMcpCustomTool("mcp__persisted_search", "persisted", "search"),
+			],
+		);
+
+		try {
+			expect(session.getSelectedMCPToolNames()).toEqual(["mcp__persisted_search"]);
+			expect(session.getSelectedDiscoveredToolNames()).toEqual(["mcp__persisted_search"]);
+
+			const result = await session.branch(targetEntryId);
+
+			expect(result.cancelled).toBe(false);
+			expect(session.getSelectedMCPToolNames()).toEqual(["mcp__constructor_search"]);
+			expect(session.getSelectedDiscoveredToolNames()).toEqual(["mcp__constructor_search", "find"]);
+			expect(session.getActiveToolNames()).toEqual(expect.arrayContaining(["mcp__constructor_search", "find"]));
+			expect(session.getActiveToolNames()).not.toContain("mcp__persisted_search");
+			expect(session.getActiveToolNames()).not.toContain("search");
+		} finally {
+			await session.dispose();
+		}
+	});
+
 	it("restores an activated discoverable built-in on the first resumed turn", async () => {
 		const sessionManager = SessionManager.inMemory();
 		const targetEntryId = sessionManager.appendMessage({

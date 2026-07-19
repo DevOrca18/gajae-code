@@ -2149,12 +2149,12 @@ export class AgentSession {
 		this.#defaultSelectedMCPToolNames = new Set(config.defaultSelectedMCPToolNames ?? []);
 		this.#constructorMCPToolSelection =
 			config.initialMCPToolSelectionIsExplicit === true
-				? this.#filterSelectableMCPToolNames(config.initialSelectedMCPToolNames ?? [])
+				? this.#filterSelectableMCPToolNames(config.initialPersistedMCPToolNames ?? [])
 				: undefined;
 		this.#constructorDiscoveredBuiltinToolSelection =
 			config.initialDiscoveredBuiltinToolSelectionIsExplicit === true
 				? selectRestorableDiscoveredBuiltinToolNames(
-						config.initialSelectedDiscoveredBuiltinToolNames ?? [],
+						config.initialPersistedDiscoveredBuiltinToolNames ?? [],
 						this.#toolRegistry,
 						this.#discoverableToolAllowedNames,
 					)

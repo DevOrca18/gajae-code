@@ -718,6 +718,7 @@ describe("AgentSession MCP discovery", () => {
 			mcpDiscoveryEnabled: true,
 			initialMCPToolSelectionIsExplicit: true,
 			initialSelectedMCPToolNames: ["mcp__docs_search"],
+			initialPersistedMCPToolNames: ["mcp__docs_search"],
 			defaultSelectedMCPToolNames: ["mcp__docs_search"],
 			rebuildSystemPrompt: async toolNames => ({
 				systemPrompt: [`tools:${toolNames.join(",")}`],
@@ -768,6 +769,7 @@ describe("AgentSession MCP discovery", () => {
 			mcpDiscoveryEnabled: true,
 			initialMCPToolSelectionIsExplicit: true,
 			initialSelectedMCPToolNames: ["mcp__docs_search"],
+			initialPersistedMCPToolNames: ["mcp__docs_search"],
 			defaultSelectedMCPToolNames: ["mcp__docs_search"],
 			rebuildSystemPrompt: async toolNames => ({
 				systemPrompt: [`tools:${toolNames.join(",")}`],
