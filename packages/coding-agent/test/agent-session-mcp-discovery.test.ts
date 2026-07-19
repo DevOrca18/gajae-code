@@ -485,6 +485,10 @@ describe("AgentSession MCP discovery", () => {
 	it("restores MCP discovery selections when branching to a context without them", async () => {
 		const readTool = createBasicTool("read", "Read");
 		const docsSearchTool = createMcpTool("mcp__docs_search", "docs", "search", "Search internal docs", ["query"]);
+		const findTool = createBasicTool("find", "Find");
+		findTool.loadMode = "discoverable";
+		const searchTool = createBasicTool("search", "Search");
+		searchTool.loadMode = "discoverable";
 		const sessionManager = SessionManager.inMemory();
 		const userEntryId = sessionManager.appendMessage({
 			role: "user",
@@ -494,42 +498,52 @@ describe("AgentSession MCP discovery", () => {
 		const toolRegistry = new Map([
 			[readTool.name, readTool],
 			[docsSearchTool.name, docsSearchTool],
+			[findTool.name, findTool],
+			[searchTool.name, searchTool],
 		]);
 		const agent = new Agent({
 			initialState: {
 				model: createModel(),
 				systemPrompt: ["initial"],
-				tools: [readTool],
+				tools: [readTool, searchTool],
 				messages: sessionManager.buildSessionContext().messages,
 			},
 		});
 		const session = new AgentSession({
 			agent,
 			sessionManager,
-			settings: Settings.isolated({ "mcp.discoveryMode": true }),
+			settings: Settings.isolated({ "tools.discoveryMode": "all" }),
 			modelRegistry: {} as never,
 			toolRegistry,
 			mcpDiscoveryEnabled: true,
+			initialSelectedDiscoveredBuiltinToolNames: ["search"],
+			initialBaselineDiscoveredBuiltinToolNames: ["search"],
 			rebuildSystemPrompt: async toolNames => ({
 				systemPrompt: [`tools:${toolNames.join(",")}`],
 			}),
 		});
 		sessions.push(session);
 
-		await session.activateDiscoveredTools(["mcp__docs_search"]);
+		await session.activateDiscoveredTools(["mcp__docs_search", "find"]);
 		expect(session.getSelectedMCPToolNames()).toEqual(["mcp__docs_search"]);
+		expect(session.getSelectedDiscoveredToolNames()).toEqual(["mcp__docs_search", "search", "find"]);
 
 		const result = await session.branch(userEntryId);
 
 		expect(result.cancelled).toBe(false);
 		expect(session.getSelectedMCPToolNames()).toEqual([]);
-		expect(session.getActiveToolNames()).toEqual(["read"]);
-		expect(session.systemPrompt).toEqual(["tools:read"]);
+		expect(session.getSelectedDiscoveredToolNames()).toEqual([]);
+		expect(session.getActiveToolNames()).toEqual(["read", "search"]);
+		expect(session.systemPrompt).toEqual(["tools:read,search"]);
 	});
 
 	it("restores MCP discovery selections when navigating to a branch without them", async () => {
 		const readTool = createBasicTool("read", "Read");
 		const docsSearchTool = createMcpTool("mcp__docs_search", "docs", "search", "Search internal docs", ["query"]);
+		const findTool = createBasicTool("find", "Find");
+		findTool.loadMode = "discoverable";
+		const searchTool = createBasicTool("search", "Search");
+		searchTool.loadMode = "discoverable";
 		const sessionManager = SessionManager.inMemory();
 		const userEntryId = sessionManager.appendMessage({
 			role: "user",
@@ -539,37 +553,43 @@ describe("AgentSession MCP discovery", () => {
 		const toolRegistry = new Map([
 			[readTool.name, readTool],
 			[docsSearchTool.name, docsSearchTool],
+			[findTool.name, findTool],
+			[searchTool.name, searchTool],
 		]);
 		const agent = new Agent({
 			initialState: {
 				model: createModel(),
 				systemPrompt: ["initial"],
-				tools: [readTool],
+				tools: [readTool, searchTool],
 				messages: sessionManager.buildSessionContext().messages,
 			},
 		});
 		const session = new AgentSession({
 			agent,
 			sessionManager,
-			settings: Settings.isolated({ "mcp.discoveryMode": true }),
+			settings: Settings.isolated({ "tools.discoveryMode": "all" }),
 			modelRegistry: {} as never,
 			toolRegistry,
 			mcpDiscoveryEnabled: true,
+			initialSelectedDiscoveredBuiltinToolNames: ["search"],
+			initialBaselineDiscoveredBuiltinToolNames: ["search"],
 			rebuildSystemPrompt: async toolNames => ({
 				systemPrompt: [`tools:${toolNames.join(",")}`],
 			}),
 		});
 		sessions.push(session);
 
-		await session.activateDiscoveredTools(["mcp__docs_search"]);
+		await session.activateDiscoveredTools(["mcp__docs_search", "find"]);
 		expect(session.getSelectedMCPToolNames()).toEqual(["mcp__docs_search"]);
+		expect(session.getSelectedDiscoveredToolNames()).toEqual(["mcp__docs_search", "search", "find"]);
 
 		const result = await session.navigateTree(userEntryId, { summarize: false });
 
 		expect(result.cancelled).toBe(false);
 		expect(session.getSelectedMCPToolNames()).toEqual([]);
-		expect(session.getActiveToolNames()).toEqual(["read"]);
-		expect(session.systemPrompt).toEqual(["tools:read"]);
+		expect(session.getSelectedDiscoveredToolNames()).toEqual([]);
+		expect(session.getActiveToolNames()).toEqual(["read", "search"]);
+		expect(session.systemPrompt).toEqual(["tools:read,search"]);
 	});
 
 	it("preserves explicit MCP baseline when branching into older history without persisted selection", async () => {
@@ -670,9 +690,15 @@ describe("AgentSession MCP discovery", () => {
 		tempDirs.push(tempDir);
 		const readTool = createBasicTool("read", "Read");
 		const docsSearchTool = createMcpTool("mcp__docs_search", "docs", "search", "Search internal docs", ["query"]);
+		const findTool = createBasicTool("find", "Find");
+		findTool.loadMode = "discoverable";
+		const searchTool = createBasicTool("search", "Search");
+		searchTool.loadMode = "discoverable";
 		const toolRegistry = new Map([
 			[readTool.name, readTool],
 			[docsSearchTool.name, docsSearchTool],
+			[findTool.name, findTool],
+			[searchTool.name, searchTool],
 		]);
 
 		const olderSessionManager = SessionManager.create(tempDir, tempDir);
@@ -702,7 +728,7 @@ describe("AgentSession MCP discovery", () => {
 			initialState: {
 				model: reasoningModel,
 				systemPrompt: ["initial"],
-				tools: [readTool, docsSearchTool],
+				tools: [readTool, searchTool, docsSearchTool, findTool],
 				messages: sessionManager.buildSessionContext().messages,
 			},
 		});
@@ -710,7 +736,7 @@ describe("AgentSession MCP discovery", () => {
 			agent,
 			sessionManager,
 			settings: Settings.isolated({
-				"mcp.discoveryMode": true,
+				"tools.discoveryMode": "all",
 				defaultThinkingLevel: "high",
 				serviceTier: "priority",
 			}),
@@ -718,6 +744,8 @@ describe("AgentSession MCP discovery", () => {
 			toolRegistry,
 			mcpDiscoveryEnabled: true,
 			initialSelectedMCPToolNames: ["mcp__docs_search"],
+			initialSelectedDiscoveredBuiltinToolNames: ["search", "find"],
+			initialBaselineDiscoveredBuiltinToolNames: ["search"],
 			defaultSelectedMCPToolNames: ["mcp__docs_search"],
 			rebuildSystemPrompt: async toolNames => ({
 				systemPrompt: [`tools:${toolNames.join(",")}`],
@@ -726,12 +754,14 @@ describe("AgentSession MCP discovery", () => {
 		sessions.push(session);
 
 		expect(session.getSelectedMCPToolNames()).toEqual(["mcp__docs_search"]);
+		expect(session.getSelectedDiscoveredToolNames()).toEqual(["mcp__docs_search", "search", "find"]);
 		sessionManager.appendThinkingLevelChange(ThinkingLevel.High);
 		sessionManager.appendServiceTierChange("flex");
-		sessionManager.appendMCPToolSelection(["mcp__docs_search"]);
+		sessionManager.appendMCPToolSelection(["mcp__docs_search"], ["search", "find"]);
 		expect(sessionManager.buildSessionContext().thinkingLevel).toBe(ThinkingLevel.High);
 		expect(sessionManager.buildSessionContext().serviceTier).toBe("flex");
 		expect(sessionManager.buildSessionContext().selectedMCPToolNames).toEqual(["mcp__docs_search"]);
+		expect(sessionManager.buildSessionContext().selectedDiscoveredBuiltinToolNames).toEqual(["search", "find"]);
 		expect(sessionManager.buildSessionContext().hasPersistedMCPToolSelection).toBe(true);
 		await sessionManager.rewriteEntries();
 		const originalSessionBeforeSwitch = fs.readFileSync(originalSessionFile!, "utf8");
@@ -743,8 +773,9 @@ describe("AgentSession MCP discovery", () => {
 		expect(session.thinkingLevel).toBe(ThinkingLevel.Medium);
 		expect(session.serviceTier).toBe("priority");
 		expect(session.getSelectedMCPToolNames()).toEqual([]);
-		expect(session.getActiveToolNames()).toEqual(["read"]);
-		expect(session.systemPrompt).toEqual(["tools:read"]);
+		expect(session.getSelectedDiscoveredToolNames()).toEqual([]);
+		expect(session.getActiveToolNames()).toEqual(["read", "search"]);
+		expect(session.systemPrompt).toEqual(["tools:read,search"]);
 		expect(fs.readFileSync(olderSessionFile!, "utf8")).toBe(olderSessionBeforeSwitch);
 		expect(fs.statSync(olderSessionFile!).mtimeMs).toBe(olderSessionMtimeBeforeSwitch);
 
@@ -753,8 +784,9 @@ describe("AgentSession MCP discovery", () => {
 		expect(session.thinkingLevel).toBe(ThinkingLevel.Medium);
 		expect(session.serviceTier).toBe("flex");
 		expect(session.getSelectedMCPToolNames()).toEqual(["mcp__docs_search"]);
-		expect(session.getActiveToolNames()).toEqual(["read", "mcp__docs_search"]);
-		expect(session.systemPrompt).toEqual(["tools:read,mcp__docs_search"]);
+		expect(session.getSelectedDiscoveredToolNames()).toEqual(["mcp__docs_search", "search", "find"]);
+		expect(session.getActiveToolNames()).toEqual(["read", "search", "mcp__docs_search", "find"]);
+		expect(session.systemPrompt).toEqual(["tools:read,search,mcp__docs_search,find"]);
 		expect(fs.readFileSync(originalSessionFile!, "utf8")).toBe(originalSessionBeforeSwitch);
 		expect(fs.statSync(originalSessionFile!).mtimeMs).toBe(originalSessionMtimeBeforeSwitch);
 	});

@@ -412,6 +412,44 @@ describe("SessionManager read-only resume", () => {
 		});
 	});
 
+	it("rejects malformed persisted discovered built-in selections", async () => {
+		const storage = new WriteTrackingStorage();
+		const filePath = "/sessions/malformed-discovered-builtins.jsonl";
+		const header = {
+			type: "session",
+			id: "malformed-discovered-builtins",
+			timestamp: new Date(0).toISOString(),
+			cwd: "/cwd",
+			version: 3,
+		};
+		const invalidEntry = {
+			type: "mcp_tool_selection",
+			id: "bad-selection",
+			parentId: null,
+			timestamp: new Date(0).toISOString(),
+			selectedToolNames: [],
+			selectedDiscoveredBuiltinToolNames: ["search_tool_bm25", 42],
+		};
+		storage.writeTextSync(filePath, `${JSON.stringify(header)}\n${JSON.stringify(invalidEntry)}\n`);
+		const stat = storage.statSync(filePath);
+		const identity: ResumeSessionIdentity = {
+			canonicalPath: filePath,
+			sessionId: "malformed-discovered-builtins",
+			dev: stat.dev,
+			ino: stat.ino,
+			size: stat.size,
+			mtimeMs: stat.mtimeMs,
+			mtimeNs: stat.mtimeNs,
+			sha256: "ignored",
+		};
+
+		expectStrictFailure(await SessionManager.openExistingStrict(identity, "/sessions", storage), "malformed");
+		expect(await SessionManager.inspectSessionTailReadOnly(filePath, storage)).toEqual({
+			kind: "error",
+			reason: "malformed",
+		});
+	});
+
 	it("preserves inspected migration state until the first v4 persistence rewrite", async () => {
 		const storage = new WriteTrackingStorage();
 		const filePath = "/sessions/legacy-v2.jsonl";

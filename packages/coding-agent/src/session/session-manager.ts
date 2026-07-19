@@ -321,11 +321,13 @@ export interface TtsrInjectionEntry extends SessionEntryBase {
 	ttsrMessageCount?: number;
 }
 
-/** Persisted MCP discovery selection state for a session branch. */
+/** Persisted discovery selection state for a session branch. */
 export interface MCPToolSelectionEntry extends SessionEntryBase {
 	type: "mcp_tool_selection";
 	/** MCP tool names selected for visibility in discovery mode. */
 	selectedToolNames: string[];
+	/** Built-in discoverable tool names activated in all-discovery mode. */
+	selectedDiscoveredBuiltinToolNames?: string[];
 }
 
 /** Session init entry - captures initial context for subagent sessions (debugging/replay). */
@@ -456,6 +458,8 @@ export interface SessionContext {
 
 	/** MCP tool names selected through discovery for this session branch. */
 	selectedMCPToolNames: string[];
+	/** Built-in discoverable tool names activated through discovery, when explicitly persisted. */
+	selectedDiscoveredBuiltinToolNames?: string[];
 	/** Whether this branch contains an explicit persisted MCP selection entry. */
 	hasPersistedMCPToolSelection: boolean;
 	/** Active mode (e.g. "plan") or "none" if no special mode is active */
@@ -992,6 +996,7 @@ export function buildSessionContext(
 
 	let selectedMCPToolNames: string[] = [];
 	let hasPersistedMCPToolSelection = false;
+	let selectedDiscoveredBuiltinToolNames: string[] | undefined;
 	let mode = "none";
 	let modeData: Record<string, unknown> | undefined;
 	// Track whether an explicit `model_change` with role="default" has been
@@ -1052,6 +1057,9 @@ export function buildSessionContext(
 			}
 		} else if (entry.type === "mcp_tool_selection") {
 			selectedMCPToolNames = [...entry.selectedToolNames];
+			if (entry.selectedDiscoveredBuiltinToolNames !== undefined) {
+				selectedDiscoveredBuiltinToolNames = [...entry.selectedDiscoveredBuiltinToolNames];
+			}
 			hasPersistedMCPToolSelection = true;
 		} else if (entry.type === "mode_change") {
 			mode = entry.mode;
@@ -1176,6 +1184,7 @@ export function buildSessionContext(
 		ttsrMessageCount,
 
 		selectedMCPToolNames,
+		selectedDiscoveredBuiltinToolNames,
 		hasPersistedMCPToolSelection,
 		mode,
 		modeData,
@@ -1201,6 +1210,9 @@ function cloneSessionContext(context: SessionContext): SessionContext {
 		ttsrMessageCount: context.ttsrMessageCount,
 
 		selectedMCPToolNames: [...context.selectedMCPToolNames],
+		selectedDiscoveredBuiltinToolNames: context.selectedDiscoveredBuiltinToolNames
+			? [...context.selectedDiscoveredBuiltinToolNames]
+			: undefined,
 		modeData: cloneJsonSemantic(context.modeData),
 	};
 }
@@ -1475,7 +1487,10 @@ function hasStrictSessionSchema(entries: FileEntry[]): boolean {
 			case "mcp_tool_selection":
 				if (
 					!Array.isArray(value.selectedToolNames) ||
-					!value.selectedToolNames.every(name => typeof name === "string")
+					!value.selectedToolNames.every(name => typeof name === "string") ||
+					(value.selectedDiscoveredBuiltinToolNames !== undefined &&
+						(!Array.isArray(value.selectedDiscoveredBuiltinToolNames) ||
+							!value.selectedDiscoveredBuiltinToolNames.every(name => typeof name === "string")))
 				)
 					return false;
 				break;
@@ -5447,17 +5462,21 @@ export class SessionManager {
 	// =========================================================================
 
 	/**
-	 * Append an MCP tool selection entry recording the discovery-selected MCP tools.
+	 * Append a discovery selection entry recording MCP and built-in discovered tools.
 	 * @param selectedToolNames MCP tool names selected for this branch
+	 * @param selectedDiscoveredBuiltinToolNames Built-in discoverable tool names selected for this branch
 	 * @returns Entry id
 	 */
-	appendMCPToolSelection(selectedToolNames: string[]): string {
+	appendMCPToolSelection(selectedToolNames: string[], selectedDiscoveredBuiltinToolNames?: string[]): string {
 		const entry: MCPToolSelectionEntry = {
 			type: "mcp_tool_selection",
 			id: generateId(this.#byId),
 			parentId: this.#leafId,
 			timestamp: new Date().toISOString(),
 			selectedToolNames: [...selectedToolNames],
+			...(selectedDiscoveredBuiltinToolNames
+				? { selectedDiscoveredBuiltinToolNames: [...selectedDiscoveredBuiltinToolNames] }
+				: {}),
 		};
 		this.#appendEntry(entry);
 		return entry.id;

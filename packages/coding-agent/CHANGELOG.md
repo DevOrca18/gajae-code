@@ -7,6 +7,9 @@
 ### Fixed
 - Malformed selectors on internal read URLs now fail explicitly instead of silently falling back to an unbounded resource read.
 
+### Fixed
+- Activated discoverable built-in tools now persist with session discovery selections and are restored on the first resumed turn and during session-context navigation, while removed, disallowed, essential, and non-discoverable tools remain filtered out.
+
 ## [0.11.3] - 2026-07-19
 ### Added
 - Bracketed pastes containing complete lists of saved static-image paths can now attach up to 16 images in source order after explicit confirmation. Paste transactions are cancellation-safe, disabled in command modes, enforce source, encoded-output, dimension, and decoded-memory budgets before commit, reject animated, remote, linked, or path-swapped sources, and restore the literal paste on cancellation or failure.

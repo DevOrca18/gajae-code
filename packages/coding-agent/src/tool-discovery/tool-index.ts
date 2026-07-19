@@ -65,6 +65,22 @@ export function isMCPToolName(name: string): boolean {
 	return name.startsWith("mcp__");
 }
 
+/** Select persisted built-in discoveries that remain eligible in the current registry and allowlist. */
+export function selectRestorableDiscoveredBuiltinToolNames(
+	toolNames: Iterable<string>,
+	toolRegistry: ReadonlyMap<string, AgentTool>,
+	allowedNames?: ReadonlySet<string>,
+): string[] {
+	const selected: string[] = [];
+	for (const name of toolNames) {
+		const tool = toolRegistry.get(name);
+		if (tool?.loadMode !== "discoverable") continue;
+		if (allowedNames && !allowedNames.has(name)) continue;
+		if (!selected.includes(name)) selected.push(name);
+	}
+	return selected;
+}
+
 export function isMCPBridgeTool(tool: { name: string; mcpServerName?: unknown; mcpToolName?: unknown }): boolean {
 	return (
 		isMCPToolName(tool.name) &&
