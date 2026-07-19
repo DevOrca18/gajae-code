@@ -290,26 +290,64 @@ describe("SDK session index", () => {
 			if (platform) Object.defineProperty(process, "platform", platform);
 		}
 	});
-	it("serializes refresh, replay, append, and snapshot races on one index instance", async () => {
+	it("holds refresh at a filesystem barrier while queued replay, append, and snapshot preserve monotonic state", async () => {
 		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-mutation-race-"));
 		const index = await new SessionIndex(dir).open();
-		await Promise.all([
-			index.refresh(),
-			index.append(event("one")),
-			index.snapshot(),
-			index.replay(),
-			index.append(event("two")),
-			index.refresh(),
-			index.snapshot(),
-			index.replay(),
-			index.append(event("three")),
-			index.refresh(),
-			index.snapshot(),
-			index.append(event("four")),
-		]);
-		expect(index.indexSeq).toBe(4);
-		expect(index.listSessions().sessions.map(session => session.sessionId)).toEqual(["one", "two", "three", "four"]);
-		expect((await index.diagnose()).status).toBe("healthy");
+		await index.append(event("before"));
+		const log = path.join(dir, "sdk", "sessions", "index.jsonl");
+		const entered = deferred();
+		const release = deferred();
+		const open = fs.open.bind(fs);
+		let holdLogRead = true;
+		const spy = vi.spyOn(fs, "open").mockImplementation((async (file: string, ...rest: unknown[]) => {
+			if (holdLogRead && path.resolve(file) === path.resolve(log) && rest[0] === "r") {
+				holdLogRead = false;
+				entered.resolve();
+				await release.promise;
+			}
+			return await (open as (file: string, ...args: unknown[]) => Promise<fs.FileHandle>)(file, ...rest);
+		}) as typeof fs.open);
+		const receipt = <T>(promise: Promise<T>) => {
+			const result: { status: "pending" | "fulfilled" | "rejected" } = { status: "pending" };
+			void promise.then(
+				() => {
+					result.status = "fulfilled";
+				},
+				() => {
+					result.status = "rejected";
+				},
+			);
+			return result;
+		};
+		try {
+			const refresh = index.refresh();
+			await entered.promise;
+			const replay = index.replay();
+			const append = index.append(event("after"));
+			const snapshot = index.snapshot();
+			const receipts = [receipt(replay), receipt(append), receipt(snapshot)];
+
+			expect(receipts).toEqual([{ status: "pending" }, { status: "pending" }, { status: "pending" }]);
+
+			release.resolve();
+			const [, , appended] = await Promise.all([refresh, replay, append, snapshot]);
+			expect(receipts).toEqual([{ status: "fulfilled" }, { status: "fulfilled" }, { status: "fulfilled" }]);
+			expect(appended.indexSeq).toBe(2);
+			expect(index.indexSeq).toBe(2);
+			expect(index.listSessions().sessions.map(session => session.sessionId)).toEqual(["before", "after"]);
+
+			const snapshotContents = JSON.parse(
+				await fs.readFile(path.join(dir, "sdk", "sessions", "index.snapshot.json"), "utf8"),
+			);
+			expect(snapshotContents.indexSeq).toBe(2);
+			expect(snapshotContents.events.map((item: SessionIndexEvent) => item.indexSeq)).toEqual([1, 2]);
+			const reopened = await new SessionIndex(dir).open();
+			expect(reopened.indexSeq).toBe(2);
+			expect(reopened.listSessions().sessions.map(session => session.sessionId)).toEqual(["before", "after"]);
+		} finally {
+			release.resolve();
+			spy.mockRestore();
+		}
 	});
 	it("serializes concurrent writers and replays a strictly monotonic log", async () => {
 		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-"));

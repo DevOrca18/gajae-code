@@ -427,47 +427,57 @@ describe("SessionManager read-only resume", () => {
 		});
 	});
 
-	it("rejects malformed persisted discovered built-in selections", async () => {
-		const storage = new WriteTrackingStorage();
-		const filePath = "/sessions/malformed-discovered-builtins.jsonl";
-		const header = {
-			type: "session",
-			id: "malformed-discovered-builtins",
-			timestamp: new Date(0).toISOString(),
-			cwd: "/cwd",
-			version: 3,
-		};
-		const invalidEntry = {
-			type: "mcp_tool_selection",
-			id: "bad-selection",
-			parentId: null,
-			timestamp: new Date(0).toISOString(),
-			selectedToolNames: [],
-			selectedDiscoveredBuiltinToolNames: ["search_tool_bm25", 42],
-		};
-		storage.writeTextSync(filePath, `${JSON.stringify(header)}\n${JSON.stringify(invalidEntry)}\n`);
-		const stat = storage.statSync(filePath);
-		const identity: ResumeSessionIdentity = {
-			canonicalPath: filePath,
-			sessionId: "malformed-discovered-builtins",
-			dev: stat.dev,
-			ino: stat.ino,
-			size: stat.size,
-			mtimeMs: stat.mtimeMs,
-			mtimeNs: stat.mtimeNs,
-			sha256: "ignored",
-		};
-
-		expectStrictFailure(await SessionManager.openExistingStrict(identity, "/sessions", storage), "malformed");
-		expect(await SessionManager.inspectSessionTailReadOnly(filePath, storage)).toEqual({
-			kind: "error",
-			reason: "malformed",
-		});
+	it("rejects malformed v5 dedicated discovered built-in selections without writes", async () => {
+		for (const selectedToolNames of [undefined, "search", ["search", 42]]) {
+			const storage = new WriteTrackingStorage();
+			const filePath = `/sessions/malformed-dedicated-${String(selectedToolNames)}.jsonl`;
+			const header = {
+				type: "session",
+				id: `malformed-dedicated-${String(selectedToolNames)}`,
+				timestamp: new Date(0).toISOString(),
+				cwd: "/cwd",
+				version: 5,
+			};
+			const entry = {
+				type: "discovered_builtin_tool_selection",
+				id: "bad-selection",
+				parentId: "message",
+				timestamp: new Date(0).toISOString(),
+				...(selectedToolNames === undefined ? {} : { selectedToolNames }),
+			};
+			storage.writeTextSync(
+				filePath,
+				`${JSON.stringify(header)}\n${sessionText("ignored").split("\n").slice(1, 2)[0]}\n${JSON.stringify(entry)}\n`,
+			);
+			storage.writes = 0;
+			const inspection = await SessionManager.inspectSessionTailReadOnly(filePath, storage);
+			expect(inspection).toEqual({ kind: "error", reason: "malformed" });
+			const stat = storage.statSync(filePath);
+			const identity: ResumeSessionIdentity = {
+				canonicalPath: filePath,
+				sessionId: header.id,
+				dev: stat.dev,
+				ino: stat.ino,
+				size: stat.size,
+				mtimeMs: stat.mtimeMs,
+				mtimeNs: stat.mtimeNs,
+				sha256: "ignored",
+			};
+			expectStrictFailure(await SessionManager.openExistingStrict(identity, "/sessions", storage), "malformed");
+			expect(storage.writes).toBe(0);
+		}
 	});
 
-	it("accepts an explicit empty dedicated discovered built-in selection without writes", async () => {
+	it("preserves an explicit empty v5 dedicated discovered built-in selection without writes", async () => {
 		const storage = new WriteTrackingStorage();
 		const filePath = "/sessions/empty-discovered-builtins.jsonl";
+		const header = {
+			type: "session",
+			id: "empty-discovered-builtins",
+			timestamp: new Date(0).toISOString(),
+			cwd: "/cwd",
+			version: 5,
+		};
 		const entry = {
 			type: "discovered_builtin_tool_selection",
 			id: "empty-selection",
@@ -475,17 +485,22 @@ describe("SessionManager read-only resume", () => {
 			timestamp: new Date(0).toISOString(),
 			selectedToolNames: [],
 		};
-		storage.writeTextSync(filePath, `${sessionText("empty-discovered-builtins")}${JSON.stringify(entry)}\n`);
+		storage.writeTextSync(
+			filePath,
+			`${JSON.stringify(header)}\n${sessionText("ignored").split("\n").slice(1, 2)[0]}\n${JSON.stringify(entry)}\n`,
+		);
 		storage.writes = 0;
 		const inspection = await SessionManager.inspectSessionTailReadOnly(filePath, storage);
 		expect(inspection.kind).toBe("resumable");
 		if (inspection.kind === "error") throw new Error("Expected resumable inspection");
 		const opened = await SessionManager.openExistingStrict(inspection.identity, "/sessions", storage);
 		expect(opened.kind).toBe("opened");
-		expect(storage.writes).toBe(0);
-		expect(await SessionManager.inspectSessionTailReadOnly(filePath, storage)).toMatchObject({
-			kind: "resumable",
+		if (opened.kind === "error") throw new Error("Expected opened session");
+		expect(opened.manager.buildSessionContext()).toMatchObject({
+			hasPersistedDiscoveredBuiltinToolSelection: true,
+			selectedDiscoveredBuiltinToolNames: [],
 		});
+		expect(storage.writes).toBe(0);
 	});
 
 	it("preserves inspected migration state until the first v5 persistence rewrite", async () => {

@@ -2122,15 +2122,17 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		};
 
 		const toolNamesFromRegistry = Array.from(toolRegistry.keys());
-		const requestedToolNames = options.toolNames
+		const hasExplicitToolNames = options.toolNames !== undefined;
+		const requestedToolNames = hasExplicitToolNames
 			? [
 					...new Set([
-						...options.toolNames.map(name => name.toLowerCase()),
+						...options.toolNames!.map(name => name.toLowerCase()),
 						...(settings.get("goal.enabled") ? ["goal"] : []),
 					]),
 				]
 			: toolNamesFromRegistry;
 		const normalizedRequested = requestedToolNames.filter(name => toolRegistry.has(name));
+		const explicitRequestedToolNames = hasExplicitToolNames ? normalizedRequested : [];
 		const requestedToolNameSet = new Set(normalizedRequested);
 		// Normalize the user-facing mcp.discoveryMode alias once at session construction.
 		const toolsDiscoveryModeSetting = settings.get("tools.discoveryMode");
@@ -2160,7 +2162,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			for (const tool of toolRegistry.values()) {
 				if (!isMCPBridgeTool(tool)) continue;
 				discoverableMCPToolNames.add(tool.name);
-				if (initialRequestedActiveToolNames.includes(tool.name)) {
+				if (explicitRequestedToolNames.includes(tool.name)) {
 					explicitlyRequestedMCPToolNames.push(tool.name);
 				}
 				const serverName = (tool as AgentTool & { mcpServerName?: string }).mcpServerName;
@@ -2177,16 +2179,16 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			defaultSelectedMCPToolNames = [
 				...new Set([
 					...discoveryDefaultServerToolNames,
-					...explicitlyRequestedMCPToolNames,
 					...(explicitMcpConfigPath !== undefined ? exactMcpToolNames : []),
 				]),
 			];
 			initialSelectedMCPToolNames = existingSession.hasPersistedMCPToolSelection
 				? restoredSelectedMCPToolNames
-				: [...new Set([...restoredSelectedMCPToolNames, ...defaultSelectedMCPToolNames])];
+				: [...new Set([...defaultSelectedMCPToolNames, ...explicitlyRequestedMCPToolNames])];
 			initialToolNames = [
 				...new Set([
 					...initialRequestedActiveToolNames.filter(name => !discoverableMCPToolNames.has(name)),
+					...defaultSelectedMCPToolNames,
 					...initialSelectedMCPToolNames,
 				]),
 			];
@@ -2226,7 +2228,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				allowedDiscoveredBuiltinNames,
 			);
 			const requestedDiscoveredBuiltinToolNames = selectRestorableDiscoveredBuiltinToolNames(
-				options.toolNames === undefined ? [] : initialRequestedActiveToolNames,
+				explicitRequestedToolNames,
 				toolRegistry,
 				allowedDiscoveredBuiltinNames,
 			);
@@ -2237,9 +2239,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			);
 			initialSelectedDiscoveredBuiltinToolNames = existingSession.hasPersistedDiscoveredBuiltinToolSelection
 				? restoredDiscoveredNames
-				: options.toolNames === undefined
-					? []
-					: requestedDiscoveredBuiltinToolNames;
+				: requestedDiscoveredBuiltinToolNames;
 			initialToolNames = [...new Set([...baselineInitialToolNames, ...initialSelectedDiscoveredBuiltinToolNames])];
 		}
 
@@ -2544,9 +2544,17 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			initialSelectedDiscoveredBuiltinToolNames,
 			initialBaselineDiscoveredBuiltinToolNames,
 			defaultSelectedMCPToolNames,
-			persistInitialMCPToolSelection: !hasExistingSession && mcpDiscoveryEnabled && options.toolNames !== undefined,
+			persistInitialMCPToolSelection: !hasExistingSession && mcpDiscoveryEnabled && hasExplicitToolNames,
 			persistInitialDiscoveredBuiltinToolSelection:
-				!hasExistingSession && effectiveDiscoveryMode === "all" && options.toolNames !== undefined,
+				!hasExistingSession && effectiveDiscoveryMode === "all" && hasExplicitToolNames,
+			initialPersistedMCPToolNames: explicitlyRequestedMCPToolNames,
+			initialPersistedDiscoveredBuiltinToolNames: selectRestorableDiscoveredBuiltinToolNames(
+				explicitRequestedToolNames,
+				toolRegistry,
+				options.discoverableToolAllowedNames
+					? new Set(options.discoverableToolAllowedNames.map(name => name.toLowerCase()))
+					: undefined,
+			),
 			defaultSelectedMCPServerNames: settings.get("mcp.discoveryDefaultServers") ?? [],
 			ttsrManager,
 			obfuscator,

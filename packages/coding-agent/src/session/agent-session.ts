@@ -538,6 +538,10 @@ export interface AgentSessionConfig {
 	persistInitialMCPToolSelection?: boolean;
 	/** Whether constructor-provided discovered-built-in selections should be persisted immediately. */
 	persistInitialDiscoveredBuiltinToolSelection?: boolean;
+	/** Explicit MCP authority to write for a new session; distinct from active fallback tools. */
+	initialPersistedMCPToolNames?: string[];
+	/** Explicit discovered built-in authority to write for a new session; distinct from active fallback tools. */
+	initialPersistedDiscoveredBuiltinToolNames?: string[];
 	/** MCP server names whose tools should seed discovery-mode sessions whenever those servers are connected. */
 	defaultSelectedMCPServerNames?: string[];
 	/** MCP tool names that should seed brand-new sessions created from this AgentSession. */
@@ -2137,29 +2141,18 @@ export class AgentSession {
 		this.#defaultSelectedMCPServerNames = new Set(config.defaultSelectedMCPServerNames ?? []);
 		this.#defaultSelectedMCPToolNames = new Set(config.defaultSelectedMCPToolNames ?? []);
 		this.#pruneSelectedMCPToolNames();
-		const persistedSelectionContext = this.buildDisplaySessionContext();
-		const persistedSelectedMCPToolNames = persistedSelectionContext.selectedMCPToolNames;
-		const persistedSelectedDiscoveredBuiltinToolNames = persistedSelectionContext.selectedDiscoveredBuiltinToolNames;
-		const currentSelectedMCPToolNames = this.getSelectedMCPToolNames();
-		const currentSelectedDiscoveredBuiltinToolNames = this.#getSelectedDiscoveredBuiltinToolNames();
 		const persistInitialMCPToolSelection = config.persistInitialMCPToolSelection ?? false;
 		const persistInitialDiscoveredBuiltinToolSelection = config.persistInitialDiscoveredBuiltinToolSelection ?? false;
 		if (
 			(this.#mcpDiscoveryEnabled || this.#resolveEffectiveDiscoveryMode() === "all") &&
-			persistInitialMCPToolSelection &&
-			!this.#selectedMCPToolNamesMatch(persistedSelectedMCPToolNames, currentSelectedMCPToolNames)
+			persistInitialMCPToolSelection
 		) {
-			this.sessionManager.appendMCPToolSelection(currentSelectedMCPToolNames);
+			this.sessionManager.appendMCPToolSelection(config.initialPersistedMCPToolNames ?? []);
 		}
-		if (
-			this.#resolveEffectiveDiscoveryMode() === "all" &&
-			persistInitialDiscoveredBuiltinToolSelection &&
-			!this.#selectedMCPToolNamesMatch(
-				persistedSelectedDiscoveredBuiltinToolNames ?? [],
-				currentSelectedDiscoveredBuiltinToolNames,
-			)
-		) {
-			this.sessionManager.appendDiscoveredBuiltinToolSelection(currentSelectedDiscoveredBuiltinToolNames);
+		if (this.#resolveEffectiveDiscoveryMode() === "all" && persistInitialDiscoveredBuiltinToolSelection) {
+			this.sessionManager.appendDiscoveredBuiltinToolSelection(
+				config.initialPersistedDiscoveredBuiltinToolNames ?? [],
+			);
 		}
 		this.#rememberSessionDefaultSelectedMCPToolNames(
 			this.sessionManager.getSessionFile(),

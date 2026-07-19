@@ -426,6 +426,42 @@ describe("AgentSession MCP discovery", () => {
 			builtinOnlySelectionEntries.filter(entry => entry.type === "discovered_builtin_tool_selection"),
 		).toHaveLength(1);
 	});
+
+	it("leaves mixed discovery activation uncommitted when the unified rebuild fails", async () => {
+		const readTool = createBasicTool("read", "Read");
+		const mcpTool = createMcpTool("mcp__docs_search", "docs", "search", "Search", ["query"]);
+		const builtinTool = createBasicTool("search", "Search");
+		builtinTool.loadMode = "discoverable";
+		const toolRegistry = new Map([
+			[readTool.name, readTool],
+			[mcpTool.name, mcpTool],
+			[builtinTool.name, builtinTool],
+		]);
+		const sessionManager = SessionManager.inMemory();
+		const agent = new Agent({
+			initialState: { model: createModel(), systemPrompt: ["initial"], tools: [readTool], messages: [] },
+		});
+		const session = new AgentSession({
+			agent,
+			sessionManager,
+			settings: Settings.isolated({ "tools.discoveryMode": "all" }),
+			modelRegistry: {} as never,
+			toolRegistry,
+			mcpDiscoveryEnabled: true,
+			rebuildSystemPrompt: async () => {
+				throw new Error("rebuild failed");
+			},
+		});
+		sessions.push(session);
+
+		const branchBefore = sessionManager.getBranch();
+		await expect(session.activateDiscoveredTools(["mcp__docs_search", "search"])).rejects.toThrow("rebuild failed");
+		expect(session.systemPrompt).toEqual(["initial"]);
+		expect(session.getActiveToolNames()).toEqual(["read"]);
+		expect(session.getSelectedMCPToolNames()).toEqual([]);
+		expect(session.getSelectedDiscoveredToolNames()).toEqual([]);
+		expect(sessionManager.getBranch()).toEqual(branchBefore);
+	});
 	it("reapplies default MCP server baselines when refreshed tools reconnect", async () => {
 		const readTool = createBasicTool("read", "Read");
 		const docsSearchTool = createMcpTool("mcp__docs_search", "docs", "search", "Search internal docs", ["query"]);
