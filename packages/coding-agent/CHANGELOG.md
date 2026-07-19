@@ -6,6 +6,7 @@
 - Malformed selectors on internal read URLs now fail explicitly instead of silently falling back to an unbounded resource read.
 - Newly registered earlier resource-GC policies advance the pending sweep without postponing an already earlier sweep.
 - Provider onboarding wizard completion is now deterministic under CI load: duplicate in-flight confirmation is suppressed, success tests await the real refresh/notification/status boundary instead of fixed sleeps, and the newly configured model is verified through the subsequent model selector.
+- OpenAI-compatible web search now turns malformed successful response bodies into bounded provider errors while preserving normal provider fallback (#2593).
 
 ### Fixed
 - Activated discoverable built-in tools now persist with independent MCP and discovered-built-in authority, preserving explicit empty selections and restoring only eligible built-ins across resumed lifecycle transitions.
@@ -22,6 +23,7 @@
 - Removed the legacy worktree cleanup implementation behind the `@gajae-code/coding-agent/cli/worktree-cli` and `@gajae-code/coding-agent/commands/worktree` package subpaths (base and `.js` forms). The `gjc worktree`/`wt` CLI command has been unregistered since the workflow-surface narrowing; the modules behind it (including the recursive-deletion `clear` path) were only reachable as package imports. The subpaths now resolve to throwing tombstone modules whose error explains the deliberate removal and the supported replacement: inspect leftover managed worktrees under `~/.gjc/wt` manually and use `git worktree remove` / `git worktree prune`.
 
 ### Fixed
+- Telegram `/btw` rich-delivery E2E coverage now awaits native and daemon teardown ownership, records exact per-iteration lifecycle phases, and uses an internal exact-tuple terminal-delivery receipt to keep fallback stress deterministic under shard load without extending the original test timeout.
 - Workflow-state handoff no longer self-locks the active-state cache, so a same-turn skill handoff (e.g. ultragoal → ralplan) completes instead of stalling behind a lock the handoff itself still holds (#2638).
 - Malformed spurious Round-0 review metadata no longer blocks an otherwise valid locked-intent question/gate, while durable intent safety remains fail-closed (#2643).
 - SDK host shutdown now retries a failed broker unregister instead of short-circuiting with a stale broker-index entry, while retained startup-cleanup owner-release failures remain isolated from the red extension-error path (#2625).
