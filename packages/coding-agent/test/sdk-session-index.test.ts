@@ -290,6 +290,27 @@ describe("SDK session index", () => {
 			if (platform) Object.defineProperty(process, "platform", platform);
 		}
 	});
+	it("serializes refresh, replay, append, and snapshot races on one index instance", async () => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-mutation-race-"));
+		const index = await new SessionIndex(dir).open();
+		await Promise.all([
+			index.refresh(),
+			index.append(event("one")),
+			index.snapshot(),
+			index.replay(),
+			index.append(event("two")),
+			index.refresh(),
+			index.snapshot(),
+			index.replay(),
+			index.append(event("three")),
+			index.refresh(),
+			index.snapshot(),
+			index.append(event("four")),
+		]);
+		expect(index.indexSeq).toBe(4);
+		expect(index.listSessions().sessions.map(session => session.sessionId)).toEqual(["one", "two", "three", "four"]);
+		expect((await index.diagnose()).status).toBe("healthy");
+	});
 	it("serializes concurrent writers and replays a strictly monotonic log", async () => {
 		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-"));
 		const one = await new SessionIndex(dir).open();

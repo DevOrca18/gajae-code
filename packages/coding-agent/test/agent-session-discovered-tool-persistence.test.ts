@@ -32,11 +32,23 @@ describe("discovered built-in tool persistence", () => {
 	});
 
 	it("keeps the prior built-in selection when a later legacy envelope omits the field", () => {
-		const session = SessionManager.inMemory();
-		session.appendMCPToolSelection(["mcp__docs_search"], ["search_tool_bm25"]);
-		session.appendMCPToolSelection(["mcp__other_search"]);
-
-		const context = session.buildSessionContext();
+		const context = buildSessionContext([
+			{
+				type: "mcp_tool_selection",
+				id: "legacy-selection",
+				parentId: null,
+				timestamp: new Date(0).toISOString(),
+				selectedToolNames: ["mcp__docs_search"],
+				selectedDiscoveredBuiltinToolNames: ["search_tool_bm25"],
+			},
+			{
+				type: "mcp_tool_selection",
+				id: "mcp-selection",
+				parentId: "legacy-selection",
+				timestamp: new Date(1).toISOString(),
+				selectedToolNames: ["mcp__other_search"],
+			},
+		]);
 		expect(context.selectedMCPToolNames).toEqual(["mcp__other_search"]);
 		expect(context.selectedDiscoveredBuiltinToolNames).toEqual(["search_tool_bm25"]);
 	});

@@ -465,6 +465,29 @@ describe("SessionManager read-only resume", () => {
 		});
 	});
 
+	it("accepts an explicit empty dedicated discovered built-in selection without writes", async () => {
+		const storage = new WriteTrackingStorage();
+		const filePath = "/sessions/empty-discovered-builtins.jsonl";
+		const entry = {
+			type: "discovered_builtin_tool_selection",
+			id: "empty-selection",
+			parentId: "message",
+			timestamp: new Date(0).toISOString(),
+			selectedToolNames: [],
+		};
+		storage.writeTextSync(filePath, `${sessionText("empty-discovered-builtins")}${JSON.stringify(entry)}\n`);
+		storage.writes = 0;
+		const inspection = await SessionManager.inspectSessionTailReadOnly(filePath, storage);
+		expect(inspection.kind).toBe("resumable");
+		if (inspection.kind === "error") throw new Error("Expected resumable inspection");
+		const opened = await SessionManager.openExistingStrict(inspection.identity, "/sessions", storage);
+		expect(opened.kind).toBe("opened");
+		expect(storage.writes).toBe(0);
+		expect(await SessionManager.inspectSessionTailReadOnly(filePath, storage)).toMatchObject({
+			kind: "resumable",
+		});
+	});
+
 	it("preserves inspected migration state until the first v5 persistence rewrite", async () => {
 		const storage = new WriteTrackingStorage();
 		const filePath = "/sessions/legacy-v2.jsonl";

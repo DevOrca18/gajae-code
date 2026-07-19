@@ -2746,6 +2746,8 @@ export function createNotificationsExtension(
 
 		onSdkRequest?: (kind: "control" | "query", connectionId: string, frame: Record<string, unknown>) => void;
 		runEphemeralTurn?: (promptText: string, signal: AbortSignal) => Promise<{ replyText: string }>;
+		/** Observes settlement of optional session-branch startup after reconciliation completes. */
+		onBranchStartupSettled?: (receipt: { sessionId: string; status: SessionStartResult["status"] }) => void;
 	} = {},
 ): void {
 	const lifecycleStartupCapability = lifecycleStartupCapabilityForApi(api);
@@ -4275,9 +4277,23 @@ export function createNotificationsExtension(
 			.catch(error => logger.warn(`notifications: deferred startup reconciliation failed: ${String(error)}`));
 
 	const trackBranchStartup = (id: string, ctx: ExtensionContext, startup: Promise<SessionStartResult>): void => {
+		let status: SessionStartResult["status"] = "failed";
+		void startup.then(
+			result => {
+				status = result.status;
+			},
+			() => {},
+		);
 		const task = reconcileBackgroundStartup(id, ctx, startup);
 		branchStartupTasks.add(task);
-		void task.finally(() => branchStartupTasks.delete(task));
+		void task.finally(() => {
+			branchStartupTasks.delete(task);
+			try {
+				options.onBranchStartupSettled?.({ sessionId: id, status });
+			} catch (error) {
+				logger.warn(`notifications: branch startup receipt failed: ${String(error)}`);
+			}
+		});
 	};
 
 	const rotateSessionAuthority = async (

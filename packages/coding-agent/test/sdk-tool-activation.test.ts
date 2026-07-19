@@ -71,6 +71,8 @@ async function createMinimalSession(
 		slashCommands: [],
 		enableMCP: false,
 		enableLsp: false,
+		notificationHostModeSupported: false,
+		sdkHostModeSupported: false,
 		toolNames,
 		customTools,
 	});

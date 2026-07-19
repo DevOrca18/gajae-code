@@ -2211,7 +2211,6 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		// The model finds them via search_tool_bm25 and activates them on demand.
 		if (effectiveDiscoveryMode === "all") {
 			const essentialBuiltinNames = new Set(computeEssentialBuiltinNames(settings));
-			const explicitlyRequestedToolNames = new Set(options.toolNames?.map(name => name.toLowerCase()) ?? []);
 			const allowedDiscoveredBuiltinNames = options.discoverableToolAllowedNames
 				? new Set(options.discoverableToolAllowedNames.map(name => name.toLowerCase()))
 				: undefined;
@@ -2219,8 +2218,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				const tool = toolRegistry.get(name);
 				if (!tool?.loadMode) return true; // not a built-in — leave MCP/custom/extension to existing logic
 				if (tool.loadMode === "essential") return true;
-				if (essentialBuiltinNames.has(name)) return true;
-				return explicitlyRequestedToolNames.has(name);
+				return essentialBuiltinNames.has(name);
 			});
 			initialBaselineDiscoveredBuiltinToolNames = selectRestorableDiscoveredBuiltinToolNames(
 				baselineInitialToolNames,
@@ -2546,17 +2544,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			initialSelectedDiscoveredBuiltinToolNames,
 			initialBaselineDiscoveredBuiltinToolNames,
 			defaultSelectedMCPToolNames,
-			persistInitialMCPToolSelection:
-				!hasExistingSession &&
-				mcpDiscoveryEnabled &&
-				(options.toolNames !== undefined
-					? options.toolNames.length === 0 || explicitlyRequestedMCPToolNames.length > 0
-					: initialSelectedMCPToolNames.length > 0),
+			persistInitialMCPToolSelection: !hasExistingSession && mcpDiscoveryEnabled && options.toolNames !== undefined,
 			persistInitialDiscoveredBuiltinToolSelection:
-				!hasExistingSession &&
-				effectiveDiscoveryMode === "all" &&
-				options.toolNames !== undefined &&
-				(options.toolNames.length === 0 || initialSelectedDiscoveredBuiltinToolNames.length > 0),
+				!hasExistingSession && effectiveDiscoveryMode === "all" && options.toolNames !== undefined,
 			defaultSelectedMCPServerNames: settings.get("mcp.discoveryDefaultServers") ?? [],
 			ttsrManager,
 			obfuscator,

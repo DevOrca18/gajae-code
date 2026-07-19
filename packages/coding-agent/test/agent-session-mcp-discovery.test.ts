@@ -8,7 +8,7 @@ import * as z from "zod/v4";
 import { Settings } from "../src/config/settings";
 import type { CustomTool } from "../src/extensibility/custom-tools/types";
 import { AgentSession } from "../src/session/agent-session";
-import { SessionManager } from "../src/session/session-manager";
+import { buildSessionContext, SessionManager } from "../src/session/session-manager";
 
 function createModel(): Model<"openai-responses"> {
 	return {
@@ -382,6 +382,7 @@ describe("AgentSession MCP discovery", () => {
 			[findTool.name, findTool],
 		]);
 		const sessionManager = SessionManager.inMemory();
+		let applyCount = 0;
 		const agent = new Agent({
 			initialState: {
 				model: createModel(),
@@ -397,9 +398,10 @@ describe("AgentSession MCP discovery", () => {
 			modelRegistry: {} as never,
 			toolRegistry,
 			mcpDiscoveryEnabled: true,
-			rebuildSystemPrompt: async toolNames => ({
-				systemPrompt: [`tools:${toolNames.join(",")}`],
-			}),
+			rebuildSystemPrompt: async toolNames => {
+				applyCount++;
+				return { systemPrompt: [`tools:${toolNames.join(",")}`] };
+			},
 		});
 		sessions.push(session);
 
@@ -408,6 +410,7 @@ describe("AgentSession MCP discovery", () => {
 			"mcp__docs_search",
 			"search",
 		]);
+		expect(applyCount).toBe(1);
 
 		const mixedSelectionEntries = sessionManager.getBranch().slice(entriesBeforeMixedActivation);
 		expect(mixedSelectionEntries.filter(entry => entry.type === "mcp_tool_selection")).toHaveLength(1);
@@ -467,7 +470,8 @@ describe("AgentSession MCP discovery", () => {
 		expect(session.getSelectedMCPToolNames()).toEqual(["mcp__slack_send_message"]);
 		expect(session.getActiveToolNames()).toEqual(["read", "mcp__slack_send_message"]);
 		expect(session.systemPrompt).toEqual(["tools:read,mcp__slack_send_message"]);
-		expect(sessionManager.buildSessionContext().selectedMCPToolNames).toEqual(["mcp__slack_send_message"]);
+		expect(sessionManager.buildSessionContext().selectedMCPToolNames).toEqual([]);
+		expect(sessionManager.buildSessionContext().hasPersistedMCPToolSelection).toBe(false);
 	});
 
 	it("persists cleared MCP selections when refresh removes a selected tool", async () => {
@@ -813,7 +817,19 @@ describe("AgentSession MCP discovery", () => {
 		expect(session.getSelectedDiscoveredToolNames()).toEqual(["mcp__docs_search", "search", "find"]);
 		sessionManager.appendThinkingLevelChange(ThinkingLevel.High);
 		sessionManager.appendServiceTierChange("flex");
-		sessionManager.appendMCPToolSelection(["mcp__docs_search"], ["search", "find"]);
+		const legacySelectionContext = buildSessionContext([
+			{
+				type: "mcp_tool_selection",
+				id: "legacy-selection",
+				parentId: null,
+				timestamp: new Date(0).toISOString(),
+				selectedToolNames: ["mcp__docs_search"],
+				selectedDiscoveredBuiltinToolNames: ["search", "find"],
+			},
+		]);
+		expect(legacySelectionContext.selectedDiscoveredBuiltinToolNames).toEqual(["search", "find"]);
+		sessionManager.appendMCPToolSelection(["mcp__docs_search"]);
+		sessionManager.appendDiscoveredBuiltinToolSelection(["search", "find"]);
 		expect(sessionManager.buildSessionContext().thinkingLevel).toBe(ThinkingLevel.High);
 		expect(sessionManager.buildSessionContext().serviceTier).toBe("flex");
 		expect(sessionManager.buildSessionContext().selectedMCPToolNames).toEqual(["mcp__docs_search"]);

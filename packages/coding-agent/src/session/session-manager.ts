@@ -5494,22 +5494,14 @@ export class SessionManager {
 	// TTSR (Time Traveling Stream Rules)
 	// =========================================================================
 
-	/**
-	 * Append a discovery selection entry recording MCP and built-in discovered tools.
-	 * @param selectedToolNames MCP tool names selected for this branch
-	 * @param selectedDiscoveredBuiltinToolNames Built-in discoverable tool names selected for this branch
-	 * @returns Entry id
-	 */
-	appendMCPToolSelection(selectedToolNames: string[], selectedDiscoveredBuiltinToolNames?: string[]): string {
+	/** Append MCP discovery selection authority without altering discovered built-in authority. */
+	appendMCPToolSelection(selectedToolNames: string[]): string {
 		const entry: MCPToolSelectionEntry = {
 			type: "mcp_tool_selection",
 			id: generateId(this.#byId),
 			parentId: this.#leafId,
 			timestamp: new Date().toISOString(),
 			selectedToolNames: [...selectedToolNames],
-			...(selectedDiscoveredBuiltinToolNames
-				? { selectedDiscoveredBuiltinToolNames: [...selectedDiscoveredBuiltinToolNames] }
-				: {}),
 		};
 		this.#appendEntry(entry);
 		return entry.id;

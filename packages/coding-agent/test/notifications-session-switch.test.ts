@@ -70,7 +70,11 @@ async function withNotifications<T>(fn: () => Promise<T>): Promise<T> {
 	}
 }
 
-function createHarness(prefix: string, initialName: string | undefined = "Original") {
+function createHarness(
+	prefix: string,
+	initialName: string | undefined = "Original",
+	onBranchStartupSettled?: (receipt: { sessionId: string; status: string }) => void,
+) {
 	const handlers = new Map<string, Handler>();
 	const commands = new Map<string, { handler: (args: string, ctx: unknown) => Promise<void> }>();
 	const api = {
@@ -81,7 +85,7 @@ function createHarness(prefix: string, initialName: string | undefined = "Origin
 			commands.set(name, command),
 		sendUserMessage: () => {},
 	} as never;
-	createNotificationsExtension(api);
+	createNotificationsExtension(api, { onBranchStartupSettled });
 
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
 	tempDirs.push(cwd);
@@ -229,7 +233,7 @@ test("session_switch publishes successor SDK authority only after AgentSession r
 		expect(cleanup.entries.get("auth-storage")?.phases.dispose).toBe("verified");
 		expect(cleanup.phases.rootAbsent).toBe("verified");
 	}
-}, 30000);
+});
 
 test("turn.prompt preflight rejection returns a correlated failure without an accepted lifecycle", async () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-notif-prompt-preflight-"));
@@ -292,7 +296,7 @@ test("turn.prompt preflight rejection returns a correlated failure without an ac
 	expect((replay?.events as Array<Record<string, unknown>>).some(event => event.kind === "agent_end")).toBe(false);
 	expect((replay?.events as Array<Record<string, unknown>>).some(event => event.kind === "agent_failed")).toBe(false);
 	await handlers.get("session_shutdown")!({ type: "session_shutdown" }, ctx);
-}, 30000);
+});
 
 test("accepted turn.prompt submission failures emit a correlated terminal event", async () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-notif-prompt-terminal-failure-"));
@@ -365,7 +369,7 @@ test("accepted turn.prompt submission failures emit a correlated terminal event"
 		]),
 	);
 	await handlers.get("session_shutdown")!({ type: "session_shutdown" }, ctx);
-}, 30000);
+});
 
 test("session_switch rotates SDK authority while preserving topic identity", async () => {
 	const prevEnv = process.env.GJC_NOTIFICATIONS;
@@ -438,7 +442,7 @@ test("session_switch rotates SDK authority while preserving topic identity", asy
 		if (prevEnv === undefined) delete process.env.GJC_NOTIFICATIONS;
 		else process.env.GJC_NOTIFICATIONS = prevEnv;
 	}
-}, 30000);
+});
 
 test("session_switch rotates authority without a previous session file", async () => {
 	await withNotifications(async () => {
@@ -464,7 +468,7 @@ test("session_switch rotates authority without a previous session file", async (
 		);
 		expect(frames.some(f => f.type === "activity" && f.sessionId === harness.sid)).toBe(false);
 	});
-}, 30000);
+});
 
 test("session_branch rotates endpoint authority", async () => {
 	await withNotifications(async () => {
@@ -481,7 +485,7 @@ test("session_branch rotates endpoint authority", async () => {
 		await waitFor(() => fs.existsSync(harness.endpoint()), 4000, "branched endpoint");
 		expect(fs.existsSync(originalEndpoint)).toBe(false);
 	});
-}, 30000);
+});
 
 test("session_branch with the same id does not await optional startup and reconciles after it settles", async () => {
 	await withNotifications(async () => {
@@ -520,7 +524,7 @@ test("session_branch with the same id does not await optional startup and reconc
 			release.resolve();
 			await startup;
 			await branch;
-			await waitFor(() => fs.existsSync(harness.endpoint()), 4000, "same-id endpoint after startup");
+			expect(fs.existsSync(harness.endpoint())).toBe(true);
 			await harness.handlers.get("session_shutdown")!({ type: "session_shutdown" }, harness.ctx);
 			expect(fs.existsSync(harness.endpoint())).toBe(false);
 		} finally {
@@ -528,12 +532,13 @@ test("session_branch with the same id does not await optional startup and reconc
 			startSpy.mockRestore();
 		}
 	});
-}, 30000);
+});
 
 test("session_branch settles before optional startup, publishes later, and shutdown drains its startup", async () => {
 	await withNotifications(async () => {
 		const entered = deferred();
 		const release = deferred();
+		const startupSettled = deferred<{ sessionId: string; status: string }>();
 		const hostStart = SessionSdkHost.prototype.start;
 		const startSpy = vi.spyOn(SessionSdkHost.prototype, "start").mockImplementation(async function (
 			this: SessionSdkHost,
@@ -542,7 +547,9 @@ test("session_branch settles before optional startup, publishes later, and shutd
 			await release.promise;
 			return await hostStart.call(this);
 		});
-		const harness = createHarness("gjc-notif-branch-new-pending-");
+		const harness = createHarness("gjc-notif-branch-new-pending-", "Original", receipt =>
+			startupSettled.resolve(receipt),
+		);
 		try {
 			const previousId = `previous-${harness.sid}`;
 			let branchSettled = false;
@@ -562,7 +569,8 @@ test("session_branch settles before optional startup, publishes later, and shutd
 
 			release.resolve();
 			await branch;
-			await waitFor(() => fs.existsSync(harness.endpoint()), 4000, "branched endpoint after optional startup");
+			expect((await startupSettled.promise).status).toBe("started");
+			expect(fs.existsSync(harness.endpoint())).toBe(true);
 			expect(getTelegramFileSink(harness.sid)).toBeDefined();
 
 			await harness.handlers.get("session_shutdown")!({ type: "session_shutdown" }, harness.ctx);
@@ -572,13 +580,12 @@ test("session_branch settles before optional startup, publishes later, and shutd
 			startSpy.mockRestore();
 		}
 	});
-}, 30000);
+});
 
 test("session_branch cleans up a failed deferred startup", async () => {
 	await withNotifications(async () => {
 		const entered = deferred();
 		const release = deferred();
-		const hostStart = SessionSdkHost.prototype.start;
 		const startSpy = vi.spyOn(SessionSdkHost.prototype, "start").mockImplementation(async function (
 			this: SessionSdkHost,
 		) {
@@ -586,7 +593,10 @@ test("session_branch cleans up a failed deferred startup", async () => {
 			await release.promise;
 			throw new Error("deferred branch startup failed");
 		});
-		const harness = createHarness("gjc-notif-branch-failed-pending-");
+		const startupSettled = deferred<{ sessionId: string; status: string }>();
+		const harness = createHarness("gjc-notif-branch-failed-pending-", "Original", receipt =>
+			startupSettled.resolve(receipt),
+		);
 		try {
 			const branch = harness.handlers.get("session_branch")!(
 				{ type: "session_branch", previousSessionFile: harness.previousSessionFile(`previous-${harness.sid}`) },
@@ -596,15 +606,16 @@ test("session_branch cleans up a failed deferred startup", async () => {
 			await branch;
 			expect(getTelegramFileSink(harness.sid)).toBeUndefined();
 			release.resolve();
-			await waitFor(() => !fs.existsSync(harness.endpoint()), 4000, "failed branch endpoint cleanup");
-			expect(getTelegramFileSink(harness.sid)).toBeUndefined();
+			expect((await startupSettled.promise).status).toBe("failed");
+			expect(fs.existsSync(harness.endpoint())).toBe(false);
 			await harness.handlers.get("session_shutdown")!({ type: "session_shutdown" }, harness.ctx);
+			expect(fs.existsSync(harness.endpoint())).toBe(false);
+			expect(getTelegramFileSink(harness.sid)).toBeUndefined();
 		} finally {
-			release.resolve();
 			startSpy.mockRestore();
 		}
 	});
-}, 30000);
+});
 
 test("session_shutdown fences and drains deferred branch startup", async () => {
 	await withNotifications(async () => {
@@ -643,7 +654,7 @@ test("session_shutdown fences and drains deferred branch startup", async () => {
 			startSpy.mockRestore();
 		}
 	});
-}, 30000);
+});
 
 test("session_switch with matching previous and current ids is a safe no-op", async () => {
 	await withNotifications(async () => {
@@ -668,7 +679,7 @@ test("session_switch with matching previous and current ids is a safe no-op", as
 			"busy activity for unchanged session id",
 		);
 	});
-}, 30000);
+});
 
 test("session_switch starts authority when the previous runtime is absent", async () => {
 	await withNotifications(async () => {
@@ -682,7 +693,7 @@ test("session_switch starts authority when the previous runtime is absent", asyn
 		);
 		await waitFor(() => fs.existsSync(harness.endpoint(newId)), 4000, "new endpoint after absent prior runtime");
 	});
-}, 30000);
+});
 
 test("session_switch to unnamed session rotates the endpoint without a title frame", async () => {
 	await withNotifications(async () => {
@@ -709,7 +720,7 @@ test("session_switch to unnamed session rotates the endpoint without a title fra
 			"idle activity for unnamed rotated session id",
 		);
 	});
-}, 30000);
+});
 
 test("session_switch can chain A to B to C with one endpoint authority at a time", async () => {
 	await withNotifications(async () => {
@@ -745,7 +756,7 @@ test("session_switch can chain A to B to C with one endpoint authority at a time
 			"busy activity for twice-rotated session id",
 		);
 	});
-}, 30000);
+});
 test("session_switch reason=resume starts a fresh runtime for the resumed session's own topic", async () => {
 	await withNotifications(async () => {
 		const harness = createHarness("gjc-notif-resume-");
@@ -779,7 +790,7 @@ test("session_switch reason=resume starts a fresh runtime for the resumed sessio
 			"busy activity for resumed session id",
 		);
 	});
-}, 30000);
+});
 
 test("session_switch keeps notification resources inactive until notify on rebinds them to the new id", async () => {
 	const previous = process.env.GJC_NOTIFICATIONS;
@@ -821,4 +832,4 @@ test("session_switch keeps notification resources inactive until notify on rebin
 		if (previous === undefined) delete process.env.GJC_NOTIFICATIONS;
 		else process.env.GJC_NOTIFICATIONS = previous;
 	}
-}, 30000);
+});

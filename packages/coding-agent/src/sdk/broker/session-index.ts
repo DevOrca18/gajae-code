@@ -230,9 +230,7 @@ export class SessionIndex {
 			group.promise = SessionIndex.#enqueue(indexPath, () => this.#prepareOpenGroup(indexPath, group!));
 		}
 		await group.promise;
-		await SessionIndex.#enqueue(indexPath, () =>
-			withFileLock(logFor(this.#agentDir), async () => await this.replay()),
-		);
+		await SessionIndex.#enqueue(indexPath, () => withFileLock(logFor(this.#agentDir), () => this.#replayUnderLock()));
 		return this;
 	}
 	async #prepareOpenGroup(indexPath: string, group: SessionIndexOpenGroup): Promise<void> {
@@ -245,6 +243,10 @@ export class SessionIndex {
 		}
 	}
 	async replay(): Promise<void> {
+		const indexPath = path.resolve(logFor(this.#agentDir));
+		await SessionIndex.#enqueue(indexPath, () => withFileLock(logFor(this.#agentDir), () => this.#replayUnderLock()));
+	}
+	async #replayUnderLock(): Promise<void> {
 		const scan = await this.#scan();
 		if (scan.diagnosis.status === "unsupported") throw scan.unsupportedError!;
 		this.#events = [...scan.snapshotEvents, ...scan.validLogEvents];
@@ -435,19 +437,19 @@ export class SessionIndex {
 				const log = scan.validLogEvents.map(event => JSON.stringify(event)).join("\n");
 				await replaceAtomically(snapshotFor(this.#agentDir), snapshot);
 				await replaceAtomically(logFor(this.#agentDir), log ? `${log}\n` : "");
-				await this.replay();
+				await this.#replayUnderLock();
 				return { ...scan.diagnosis, repaired: true, quarantinePath };
 			});
 		});
 	}
-	async #tail(snapshotSeq = this.indexSeq, allowResync = true): Promise<void> {
+	async #tailUnderLock(snapshotSeq = this.indexSeq, allowResync = true): Promise<void> {
 		let data: Buffer;
 		try {
 			const handle = await fs.open(logFor(this.#agentDir), "r");
 			try {
 				const stat = await handle.stat();
 				if (stat.size < this.#logOffset) {
-					if (allowResync) await this.replay();
+					if (allowResync) await this.#replayUnderLock();
 					else this.#warn("Session index log was truncated");
 					return;
 				}
@@ -485,7 +487,7 @@ export class SessionIndex {
 		if (corrupt) {
 			this.#corruptSuffix = true;
 			this.#warn("Corrupt session index entry; replay truncated");
-			if (allowResync) await this.replay();
+			if (allowResync) await this.#replayUnderLock();
 		}
 	}
 	#warn(message: string): void {
@@ -493,7 +495,13 @@ export class SessionIndex {
 	}
 
 	async refresh(): Promise<void> {
-		await this.#tail();
+		const indexPath = path.resolve(logFor(this.#agentDir));
+		await SessionIndex.#enqueue(indexPath, () =>
+			withFileLock(logFor(this.#agentDir), () => this.#refreshUnderLock()),
+		);
+	}
+	async #refreshUnderLock(): Promise<void> {
+		await this.#tailUnderLock();
 	}
 	get indexSeq(): number {
 		return this.#events.at(-1)?.indexSeq ?? 0;
@@ -506,7 +514,7 @@ export class SessionIndex {
 		return await SessionIndex.#enqueue(indexPath, async () => {
 			await fs.mkdir(dirFor(this.#agentDir), { recursive: true, mode: 0o700 });
 			return await withFileLock(logFor(this.#agentDir), async () => {
-				await this.replay();
+				await this.#replayUnderLock();
 				if (this.#corruptSuffix)
 					throw new Error(
 						"Cannot append to corrupt session index log; run `gjc gc --repair-session-index` to quarantine evidence and retain the valid prefix",
@@ -519,7 +527,7 @@ export class SessionIndex {
 				};
 				const event: SessionIndexEvent = { ...unsigned, checksum: sessionIndexChecksum(unsigned) };
 				await appendSync(logFor(this.#agentDir), JSON.stringify(event));
-				await this.refresh();
+				await this.#refreshUnderLock();
 				if ((await fs.stat(logFor(this.#agentDir))).size >= ROTATE_BYTES) await this.#rotate();
 				return event;
 			});
@@ -532,7 +540,7 @@ export class SessionIndex {
 		);
 	}
 	async #snapshotUnderLock(): Promise<void> {
-		await this.replay();
+		await this.#replayUnderLock();
 		const file = snapshotFor(this.#agentDir);
 		let current: unknown;
 		try {
