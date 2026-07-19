@@ -716,6 +716,7 @@ describe("AgentSession MCP discovery", () => {
 			modelRegistry: {} as never,
 			toolRegistry,
 			mcpDiscoveryEnabled: true,
+			initialMCPToolSelectionIsExplicit: true,
 			initialSelectedMCPToolNames: ["mcp__docs_search"],
 			defaultSelectedMCPToolNames: ["mcp__docs_search"],
 			rebuildSystemPrompt: async toolNames => ({
@@ -765,6 +766,7 @@ describe("AgentSession MCP discovery", () => {
 			modelRegistry: {} as never,
 			toolRegistry,
 			mcpDiscoveryEnabled: true,
+			initialMCPToolSelectionIsExplicit: true,
 			initialSelectedMCPToolNames: ["mcp__docs_search"],
 			defaultSelectedMCPToolNames: ["mcp__docs_search"],
 			rebuildSystemPrompt: async toolNames => ({
@@ -874,16 +876,15 @@ describe("AgentSession MCP discovery", () => {
 		await sessionManager.rewriteEntries();
 		const originalSessionBeforeSwitch = fs.readFileSync(originalSessionFile!, "utf8");
 		const originalSessionMtimeBeforeSwitch = fs.statSync(originalSessionFile!).mtimeMs;
-		await Bun.sleep(20);
 
 		await session.switchSession(olderSessionFile!);
 		expect(session.sessionFile).toBe(olderSessionFile);
 		expect(session.thinkingLevel).toBe(ThinkingLevel.Medium);
 		expect(session.serviceTier).toBe("priority");
-		expect(session.getSelectedMCPToolNames()).toEqual([]);
-		expect(session.getSelectedDiscoveredToolNames()).toEqual([]);
-		expect(session.getActiveToolNames()).toEqual(["read", "search"]);
-		expect(session.systemPrompt).toEqual(["tools:read,search"]);
+		expect(session.getSelectedMCPToolNames()).toEqual(["mcp__docs_search"]);
+		expect(session.getSelectedDiscoveredToolNames()).toEqual(["mcp__docs_search"]);
+		expect(session.getActiveToolNames()).toEqual(["read", "search", "mcp__docs_search"]);
+		expect(session.systemPrompt).toEqual(["tools:read,search,mcp__docs_search"]);
 		expect(fs.readFileSync(olderSessionFile!, "utf8")).toBe(olderSessionBeforeSwitch);
 		expect(fs.statSync(olderSessionFile!).mtimeMs).toBe(olderSessionMtimeBeforeSwitch);
 
@@ -941,8 +942,8 @@ describe("AgentSession MCP discovery", () => {
 			]),
 		]);
 
-		expect(session.getSelectedMCPToolNames()).toEqual(["mcp__docs_search"]);
-		expect(session.getActiveToolNames()).toEqual(["read", "mcp__docs_search"]);
+		expect(session.getSelectedMCPToolNames()).toEqual(["mcp__docs_search", "mcp__slack_send_message"]);
+		expect(session.getActiveToolNames()).toEqual(["read", "mcp__docs_search", "mcp__slack_send_message"]);
 
 		await session.newSession();
 

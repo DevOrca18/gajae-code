@@ -2223,13 +2223,14 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				if (tool.loadMode === "essential") return true;
 				return essentialBuiltinNames.has(name);
 			});
-			initialBaselineDiscoveredBuiltinToolNames = selectRestorableDiscoveredBuiltinToolNames(
-				baselineInitialToolNames,
+			const requestedDiscoveredBuiltinToolNames = selectRestorableDiscoveredBuiltinToolNames(
+				explicitRequestedToolNames,
 				toolRegistry,
 				allowedDiscoveredBuiltinNames,
 			);
-			const requestedDiscoveredBuiltinToolNames = selectRestorableDiscoveredBuiltinToolNames(
-				explicitRequestedToolNames,
+			const requestedDiscoveredBuiltinToolNameSet = new Set(requestedDiscoveredBuiltinToolNames);
+			initialBaselineDiscoveredBuiltinToolNames = selectRestorableDiscoveredBuiltinToolNames(
+				baselineInitialToolNames.filter(name => !requestedDiscoveredBuiltinToolNameSet.has(name)),
 				toolRegistry,
 				allowedDiscoveredBuiltinNames,
 			);
@@ -2547,9 +2548,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			initialSelectedDiscoveredBuiltinToolNames,
 			initialBaselineDiscoveredBuiltinToolNames,
 			defaultSelectedMCPToolNames,
-			persistInitialMCPToolSelection: !hasExistingSession && mcpDiscoveryEnabled && hasExplicitToolNames,
-			persistInitialDiscoveredBuiltinToolSelection:
-				!hasExistingSession && effectiveDiscoveryMode === "all" && hasExplicitToolNames,
+			persistInitialMCPToolSelection: false,
+			persistInitialDiscoveredBuiltinToolSelection: false,
 			initialPersistedMCPToolNames: explicitlyRequestedMCPToolNames,
 			initialPersistedDiscoveredBuiltinToolNames: selectRestorableDiscoveredBuiltinToolNames(
 				explicitRequestedToolNames,
