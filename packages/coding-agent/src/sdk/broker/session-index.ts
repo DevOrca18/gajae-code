@@ -194,11 +194,11 @@ function alive(pid: number): boolean {
 }
 
 interface SessionIndexOpenGroup {
-	indexes: Set<SessionIndex>;
 	promise: Promise<void>;
 	closed: boolean;
 }
 export class SessionIndex {
+	static #operations = new Map<string, Promise<void>>();
 	static #openGroups = new Map<string, SessionIndexOpenGroup>();
 	#agentDir: string;
 	#events: SessionIndexEvent[] = [];
@@ -208,31 +208,37 @@ export class SessionIndex {
 	constructor(agentDir: string) {
 		this.#agentDir = agentDir;
 	}
+	static #enqueue<T>(indexPath: string, operation: () => Promise<T>): Promise<T> {
+		const previous = SessionIndex.#operations.get(indexPath) ?? Promise.resolve();
+		const promise = previous.catch(() => {}).then(operation);
+		const completion = promise.then(
+			() => {},
+			() => {},
+		);
+		SessionIndex.#operations.set(indexPath, completion);
+		void completion.then(() => {
+			if (SessionIndex.#operations.get(indexPath) === completion) SessionIndex.#operations.delete(indexPath);
+		});
+		return promise;
+	}
 	async open(): Promise<this> {
 		const indexPath = path.resolve(logFor(this.#agentDir));
 		let group = SessionIndex.#openGroups.get(indexPath);
 		if (!group || group.closed) {
-			group = { indexes: new Set(), promise: Promise.resolve(), closed: false };
+			group = { promise: Promise.resolve(), closed: false };
 			SessionIndex.#openGroups.set(indexPath, group);
-			group.promise = this.#openGroup(indexPath, group);
+			group.promise = SessionIndex.#enqueue(indexPath, () => this.#prepareOpenGroup(indexPath, group!));
 		}
-		group.indexes.add(this);
 		await group.promise;
+		await SessionIndex.#enqueue(indexPath, () =>
+			withFileLock(logFor(this.#agentDir), async () => await this.replay()),
+		);
 		return this;
 	}
-	async #openGroup(indexPath: string, group: SessionIndexOpenGroup): Promise<void> {
+	async #prepareOpenGroup(indexPath: string, group: SessionIndexOpenGroup): Promise<void> {
 		try {
 			await fs.mkdir(dirFor(this.#agentDir), { recursive: true, mode: 0o700 });
 			await fs.chmod(dirFor(this.#agentDir), 0o700);
-			await withFileLock(logFor(this.#agentDir), async () => {
-				while (group.indexes.size > 0) {
-					const indexes = [...group.indexes];
-					group.indexes.clear();
-					await Promise.all(indexes.map(index => index.replay()));
-				}
-				group.closed = true;
-				if (SessionIndex.#openGroups.get(indexPath) === group) SessionIndex.#openGroups.delete(indexPath);
-			});
 		} finally {
 			group.closed = true;
 			if (SessionIndex.#openGroups.get(indexPath) === group) SessionIndex.#openGroups.delete(indexPath);
@@ -386,46 +392,52 @@ export class SessionIndex {
 		};
 	}
 	async diagnose(): Promise<SessionIndexDiagnosis> {
-		const exists = await Promise.all(
-			[snapshotFor(this.#agentDir), logFor(this.#agentDir)].map(async file => {
-				try {
-					await fs.stat(file);
-					return true;
-				} catch (error) {
-					if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
-					throw error;
-				}
-			}),
-		);
-		if (!exists.some(Boolean)) return { status: "healthy", validPrefixSeq: 0, snapshotSeq: 0 };
-		return await withFileLock(logFor(this.#agentDir), async () => (await this.#scan()).diagnosis);
+		const indexPath = path.resolve(logFor(this.#agentDir));
+		return await SessionIndex.#enqueue(indexPath, async () => {
+			const exists = await Promise.all(
+				[snapshotFor(this.#agentDir), logFor(this.#agentDir)].map(async file => {
+					try {
+						await fs.stat(file);
+						return true;
+					} catch (error) {
+						if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+						throw error;
+					}
+				}),
+			);
+			if (!exists.some(Boolean)) return { status: "healthy", validPrefixSeq: 0, snapshotSeq: 0 };
+			return await withFileLock(logFor(this.#agentDir), async () => (await this.#scan()).diagnosis);
+		});
 	}
 	async repair(): Promise<SessionIndexRepairResult> {
-		await fs.mkdir(dirFor(this.#agentDir), { recursive: true, mode: 0o700 });
-		return await withFileLock(logFor(this.#agentDir), async () => {
-			const scan = await this.#scan();
-			if (scan.diagnosis.status === "unsupported") return { ...scan.diagnosis, repaired: false };
-			if (scan.diagnosis.status === "healthy") return { ...scan.diagnosis, repaired: false };
-			const quarantineBase = path.join(dirFor(this.#agentDir), "quarantine");
-			await fs.mkdir(quarantineBase, { recursive: true, mode: 0o700 });
-			await syncDirectory(quarantineBase);
-			const quarantinePath = path.join(quarantineBase, `repair-${Date.now()}-${process.pid}-${randomUUID()}`);
-			await fs.mkdir(quarantinePath, { mode: 0o700 });
-			await syncDirectory(quarantinePath);
-			if (scan.snapshotContents)
-				await writeAndSync(path.join(quarantinePath, "index.snapshot.json"), scan.snapshotContents);
-			if (scan.logContents) await writeAndSync(path.join(quarantinePath, "index.jsonl"), scan.logContents);
-			await syncDirectory(path.join(quarantinePath, "index.jsonl"));
-			const snapshot = JSON.stringify({
-				version: SESSION_INDEX_SNAPSHOT_VERSION,
-				indexSeq: scan.snapshotEvents.at(-1)?.indexSeq ?? 0,
-				events: scan.snapshotEvents,
+		const indexPath = path.resolve(logFor(this.#agentDir));
+		return await SessionIndex.#enqueue(indexPath, async () => {
+			await fs.mkdir(dirFor(this.#agentDir), { recursive: true, mode: 0o700 });
+			return await withFileLock(logFor(this.#agentDir), async () => {
+				const scan = await this.#scan();
+				if (scan.diagnosis.status === "unsupported") return { ...scan.diagnosis, repaired: false };
+				if (scan.diagnosis.status === "healthy") return { ...scan.diagnosis, repaired: false };
+				const quarantineBase = path.join(dirFor(this.#agentDir), "quarantine");
+				await fs.mkdir(quarantineBase, { recursive: true, mode: 0o700 });
+				await syncDirectory(quarantineBase);
+				const quarantinePath = path.join(quarantineBase, `repair-${Date.now()}-${process.pid}-${randomUUID()}`);
+				await fs.mkdir(quarantinePath, { mode: 0o700 });
+				await syncDirectory(quarantinePath);
+				if (scan.snapshotContents)
+					await writeAndSync(path.join(quarantinePath, "index.snapshot.json"), scan.snapshotContents);
+				if (scan.logContents) await writeAndSync(path.join(quarantinePath, "index.jsonl"), scan.logContents);
+				await syncDirectory(path.join(quarantinePath, "index.jsonl"));
+				const snapshot = JSON.stringify({
+					version: SESSION_INDEX_SNAPSHOT_VERSION,
+					indexSeq: scan.snapshotEvents.at(-1)?.indexSeq ?? 0,
+					events: scan.snapshotEvents,
+				});
+				const log = scan.validLogEvents.map(event => JSON.stringify(event)).join("\n");
+				await replaceAtomically(snapshotFor(this.#agentDir), snapshot);
+				await replaceAtomically(logFor(this.#agentDir), log ? `${log}\n` : "");
+				await this.replay();
+				return { ...scan.diagnosis, repaired: true, quarantinePath };
 			});
-			const log = scan.validLogEvents.map(event => JSON.stringify(event)).join("\n");
-			await replaceAtomically(snapshotFor(this.#agentDir), snapshot);
-			await replaceAtomically(logFor(this.#agentDir), log ? `${log}\n` : "");
-			await this.replay();
-			return { ...scan.diagnosis, repaired: true, quarantinePath };
 		});
 	}
 	async #tail(snapshotSeq = this.indexSeq, allowResync = true): Promise<void> {
@@ -490,28 +502,34 @@ export class SessionIndex {
 		input: Omit<SessionIndexEvent, "version" | "indexSeq" | "checksum" | "ts"> &
 			Partial<Pick<SessionIndexEvent, "ts">>,
 	): Promise<SessionIndexEvent> {
-		await fs.mkdir(dirFor(this.#agentDir), { recursive: true, mode: 0o700 });
-		return withFileLock(logFor(this.#agentDir), async () => {
-			await this.replay();
-			if (this.#corruptSuffix)
-				throw new Error(
-					"Cannot append to corrupt session index log; run `gjc gc --repair-session-index` to quarantine evidence and retain the valid prefix",
-				);
-			const unsigned: Omit<SessionIndexEvent, "checksum"> = {
-				...input,
-				version: SDK_STATE_VERSION,
-				indexSeq: this.indexSeq + 1,
-				ts: input.ts ?? Date.now(),
-			};
-			const event: SessionIndexEvent = { ...unsigned, checksum: sessionIndexChecksum(unsigned) };
-			await appendSync(logFor(this.#agentDir), JSON.stringify(event));
-			await this.refresh();
-			if ((await fs.stat(logFor(this.#agentDir))).size >= ROTATE_BYTES) await this.#rotate();
-			return event;
+		const indexPath = path.resolve(logFor(this.#agentDir));
+		return await SessionIndex.#enqueue(indexPath, async () => {
+			await fs.mkdir(dirFor(this.#agentDir), { recursive: true, mode: 0o700 });
+			return await withFileLock(logFor(this.#agentDir), async () => {
+				await this.replay();
+				if (this.#corruptSuffix)
+					throw new Error(
+						"Cannot append to corrupt session index log; run `gjc gc --repair-session-index` to quarantine evidence and retain the valid prefix",
+					);
+				const unsigned: Omit<SessionIndexEvent, "checksum"> = {
+					...input,
+					version: SDK_STATE_VERSION,
+					indexSeq: this.indexSeq + 1,
+					ts: input.ts ?? Date.now(),
+				};
+				const event: SessionIndexEvent = { ...unsigned, checksum: sessionIndexChecksum(unsigned) };
+				await appendSync(logFor(this.#agentDir), JSON.stringify(event));
+				await this.refresh();
+				if ((await fs.stat(logFor(this.#agentDir))).size >= ROTATE_BYTES) await this.#rotate();
+				return event;
+			});
 		});
 	}
 	async snapshot(): Promise<void> {
-		await withFileLock(logFor(this.#agentDir), () => this.#snapshotUnderLock());
+		const indexPath = path.resolve(logFor(this.#agentDir));
+		await SessionIndex.#enqueue(indexPath, () =>
+			withFileLock(logFor(this.#agentDir), () => this.#snapshotUnderLock()),
+		);
 	}
 	async #snapshotUnderLock(): Promise<void> {
 		await this.replay();

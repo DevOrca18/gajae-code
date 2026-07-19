@@ -625,24 +625,26 @@ describe("SDK session index", () => {
 		expect(replacementChecks).toBe(2);
 	});
 	it("serializes repair with a racing writer and resumes after the retained prefix", async () => {
-		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-"));
-		const seed = await new SessionIndex(dir).open();
-		await seed.append(event("snapshot"));
-		await seed.snapshot();
-		await seed.append(event("prefix"));
-		const inverted = { ...event("inverted"), version: SDK_STATE_VERSION, indexSeq: 1, ts: 1 };
-		await fs.appendFile(
-			path.join(dir, "sdk", "sessions", "index.jsonl"),
-			`${JSON.stringify({ ...inverted, checksum: sessionIndexChecksum(inverted as Parameters<typeof sessionIndexChecksum>[0]) })}\n`,
-		);
-		const corrupt = await new SessionIndex(dir).open();
-		const repairing = corrupt.repair();
-		const writer = new SessionIndex(dir);
-		const appended = await writer.append(event("racing-writer"));
-		expect((await repairing).validPrefixSeq).toBe(2);
-		expect(appended.indexSeq).toBe(3);
-		const replay = await new SessionIndex(dir).open();
-		expect(replay.indexSeq).toBe(3);
-		expect((await replay.diagnose()).status).toBe("healthy");
+		for (let attempt = 0; attempt < 8; attempt++) {
+			const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-"));
+			const seed = await new SessionIndex(dir).open();
+			await seed.append(event("snapshot"));
+			await seed.snapshot();
+			await seed.append(event("prefix"));
+			const inverted = { ...event("inverted"), version: SDK_STATE_VERSION, indexSeq: 1, ts: 1 };
+			await fs.appendFile(
+				path.join(dir, "sdk", "sessions", "index.jsonl"),
+				`${JSON.stringify({ ...inverted, checksum: sessionIndexChecksum(inverted as Parameters<typeof sessionIndexChecksum>[0]) })}\n`,
+			);
+			const corrupt = await new SessionIndex(dir).open();
+			const repairing = corrupt.repair();
+			const writer = new SessionIndex(dir);
+			const appended = await writer.append(event("racing-writer"));
+			expect((await repairing).validPrefixSeq).toBe(2);
+			expect(appended.indexSeq).toBe(3);
+			const replay = await new SessionIndex(dir).open();
+			expect(replay.indexSeq).toBe(3);
+			expect((await replay.diagnose()).status).toBe("healthy");
+		}
 	});
 });
