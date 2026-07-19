@@ -2761,9 +2761,12 @@ export function createNotificationsExtension(
 	// exact runtime object retains authority for an explicit idempotent retry.
 	const cleanupRetries = new Map<string, SessionRuntime>();
 	const sessionStartPromises = new Map<string, Promise<SessionStartResult>>();
+	const branchStartupTasks = new Set<Promise<void>>();
 	let activeRuntimeId: string | undefined;
 	let identityControlInFlight = false;
-	let deferredIdentityRotation: { event: { previousSessionFile?: string }; ctx: ExtensionContext } | undefined;
+	let deferredIdentityRotation:
+		| { event: { previousSessionFile?: string }; ctx: ExtensionContext; awaitStartup: boolean }
+		| undefined;
 	let extensionShuttingDown = false;
 
 	async function ensureTelegramOwner(
@@ -3371,7 +3374,8 @@ export function createNotificationsExtension(
 					const pending = deferredIdentityRotation;
 					deferredIdentityRotation = undefined;
 					identityControlInFlight = false;
-					if (response.ok === true && pending) await rotateSessionAuthority(pending.event, pending.ctx);
+					if (response.ok === true && pending)
+						await rotateSessionAuthority(pending.event, pending.ctx, pending.awaitStartup);
 				}
 			},
 			control: async (connectionId, frame) => {
@@ -4247,15 +4251,16 @@ export function createNotificationsExtension(
 		await controller.reconcileCurrentSession(ctx);
 	});
 
-	// Startup is optional unless a lifecycle request explicitly owns it. Branch and
-	// switch commit session identity independently, so observe optional startup and
-	// reconcile only after it has made the runtime reachable.
+	// A session endpoint's token and generation are authority for exactly one
+	// session id. `/new`, fork, and resume must all tear down A before publishing
+	// B. Chat implementations may preserve a topic as metadata, but it must never
+	// preserve A's endpoint or credentials as B's control/viewing authority.
 	const reconcileBackgroundStartup = (
 		id: string,
 		ctx: ExtensionContext,
 		startup: Promise<SessionStartResult>,
-	): void => {
-		void startup
+	): Promise<void> =>
+		startup
 			.then(async result => {
 				if (
 					result.status !== "started" ||
@@ -4268,15 +4273,17 @@ export function createNotificationsExtension(
 				await controller.reconcileCurrentSession(ctx);
 			})
 			.catch(error => logger.warn(`notifications: deferred startup reconciliation failed: ${String(error)}`));
+
+	const trackBranchStartup = (id: string, ctx: ExtensionContext, startup: Promise<SessionStartResult>): void => {
+		const task = reconcileBackgroundStartup(id, ctx, startup);
+		branchStartupTasks.add(task);
+		void task.finally(() => branchStartupTasks.delete(task));
 	};
 
-	// A session endpoint's token and generation are authority for exactly one
-	// session id. `/new`, fork, and resume must all tear down A before publishing
-	// B. Chat implementations may preserve a topic as metadata, but it must never
-	// preserve A's endpoint or credentials as B's control/viewing authority.
 	const rotateSessionAuthority = async (
 		event: { previousSessionFile?: string },
 		ctx: ExtensionContext,
+		awaitStartup: boolean,
 	): Promise<void> => {
 		if (extensionShuttingDown) return;
 		const newId = sessionId(ctx);
@@ -4284,7 +4291,13 @@ export function createNotificationsExtension(
 		if (prevId === newId) {
 			const pendingStartup = sessionStartPromises.get(newId);
 			if (pendingStartup) {
-				reconcileBackgroundStartup(newId, ctx, pendingStartup);
+				if (awaitStartup) {
+					await pendingStartup;
+					if (!extensionShuttingDown && runtimes.has(newId) && activeRuntimeId === newId)
+						await controller.reconcileCurrentSession(ctx);
+				} else {
+					trackBranchStartup(newId, ctx, pendingStartup);
+				}
 				return;
 			}
 			if (runtimes.has(newId)) {
@@ -4306,7 +4319,7 @@ export function createNotificationsExtension(
 		}
 		if (extensionShuttingDown) return;
 		const startup = startSession(ctx);
-		if (lifecycleStartupCapability) {
+		if (awaitStartup) {
 			await startup;
 			if (extensionShuttingDown) {
 				await stopSession(newId);
@@ -4315,21 +4328,21 @@ export function createNotificationsExtension(
 			await controller.reconcileCurrentSession(ctx);
 			return;
 		}
-		reconcileBackgroundStartup(newId, ctx, startup);
+		trackBranchStartup(newId, ctx, startup);
 	};
 	api.on("session_switch", async (event, ctx) => {
 		if (identityControlInFlight) {
-			deferredIdentityRotation = { event, ctx };
+			deferredIdentityRotation = { event, ctx, awaitStartup: true };
 			return;
 		}
-		await rotateSessionAuthority(event, ctx);
+		await rotateSessionAuthority(event, ctx, true);
 	});
 	api.on("session_branch", async (event, ctx) => {
 		if (identityControlInFlight) {
-			deferredIdentityRotation = { event, ctx };
+			deferredIdentityRotation = { event, ctx, awaitStartup: false };
 			return;
 		}
-		await rotateSessionAuthority(event, ctx);
+		await rotateSessionAuthority(event, ctx, false);
 	});
 
 	const terminalizeInFlightTools = (rt: SessionRuntime, id: string, phase: "cancelled" | "unknown"): void => {
@@ -4686,6 +4699,7 @@ export function createNotificationsExtension(
 		extensionShuttingDown = true;
 		identityControlInFlight = false;
 		deferredIdentityRotation = undefined;
+		await Promise.allSettled([...branchStartupTasks]);
 		const id = sessionId(ctx);
 		const rt = runtimes.get(id);
 		if (rt) terminalizeInFlightTools(rt, id, "unknown");

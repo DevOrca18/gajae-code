@@ -422,7 +422,8 @@ test("session_switch rotates SDK authority while preserving topic identity", asy
 		await handlers.get("session_switch")!({ type: "session_switch", reason: "new", previousSessionFile }, ctx);
 
 		const newEndpoint = path.join(notifDir, `${sid}.json`);
-		await waitFor(() => fs.existsSync(newEndpoint), 4000, "rotated endpoint file");
+		expect(fs.existsSync(newEndpoint)).toBe(true);
+		expect(getTelegramFileSink(sid)).toBeDefined();
 		expect(fs.existsSync(originalEndpoint)).toBe(false);
 		const newFrames = await connectFrames(newEndpoint);
 
@@ -529,7 +530,7 @@ test("session_branch with the same id does not await optional startup and reconc
 	});
 }, 30000);
 
-test("session_branch to a new id does not await optional startup and disposes it after it settles", async () => {
+test("session_branch settles before optional startup, publishes later, and shutdown drains its startup", async () => {
 	await withNotifications(async () => {
 		const entered = deferred();
 		const release = deferred();
@@ -557,11 +558,86 @@ test("session_branch to a new id does not await optional startup and disposes it
 			await Promise.resolve();
 			await Promise.resolve();
 			expect(branchSettled).toBe(true);
+			expect(fs.existsSync(harness.endpoint())).toBe(false);
 
-			await harness.handlers.get("session_shutdown")!({ type: "session_shutdown" }, harness.ctx);
 			release.resolve();
 			await branch;
-			await waitFor(() => !fs.existsSync(harness.endpoint()), 4000, "new-id endpoint removed after startup");
+			await waitFor(() => fs.existsSync(harness.endpoint()), 4000, "branched endpoint after optional startup");
+			expect(getTelegramFileSink(harness.sid)).toBeDefined();
+
+			await harness.handlers.get("session_shutdown")!({ type: "session_shutdown" }, harness.ctx);
+			expect(fs.existsSync(harness.endpoint())).toBe(false);
+		} finally {
+			release.resolve();
+			startSpy.mockRestore();
+		}
+	});
+}, 30000);
+
+test("session_branch cleans up a failed deferred startup", async () => {
+	await withNotifications(async () => {
+		const entered = deferred();
+		const release = deferred();
+		const hostStart = SessionSdkHost.prototype.start;
+		const startSpy = vi.spyOn(SessionSdkHost.prototype, "start").mockImplementation(async function (
+			this: SessionSdkHost,
+		) {
+			entered.resolve();
+			await release.promise;
+			throw new Error("deferred branch startup failed");
+		});
+		const harness = createHarness("gjc-notif-branch-failed-pending-");
+		try {
+			const branch = harness.handlers.get("session_branch")!(
+				{ type: "session_branch", previousSessionFile: harness.previousSessionFile(`previous-${harness.sid}`) },
+				harness.ctx,
+			);
+			await entered.promise;
+			await branch;
+			expect(getTelegramFileSink(harness.sid)).toBeUndefined();
+			release.resolve();
+			await waitFor(() => !fs.existsSync(harness.endpoint()), 4000, "failed branch endpoint cleanup");
+			expect(getTelegramFileSink(harness.sid)).toBeUndefined();
+			await harness.handlers.get("session_shutdown")!({ type: "session_shutdown" }, harness.ctx);
+		} finally {
+			release.resolve();
+			startSpy.mockRestore();
+		}
+	});
+}, 30000);
+
+test("session_shutdown fences and drains deferred branch startup", async () => {
+	await withNotifications(async () => {
+		const entered = deferred();
+		const release = deferred();
+		const hostStart = SessionSdkHost.prototype.start;
+		const startSpy = vi.spyOn(SessionSdkHost.prototype, "start").mockImplementation(async function (
+			this: SessionSdkHost,
+		) {
+			entered.resolve();
+			await release.promise;
+			return await hostStart.call(this);
+		});
+		const harness = createHarness("gjc-notif-branch-shutdown-pending-");
+		try {
+			const branch = harness.handlers.get("session_branch")!(
+				{ type: "session_branch", previousSessionFile: harness.previousSessionFile(`previous-${harness.sid}`) },
+				harness.ctx,
+			);
+			await entered.promise;
+			await branch;
+			let shutdownSettled = false;
+			const shutdown = Promise.resolve(
+				harness.handlers.get("session_shutdown")!({ type: "session_shutdown" }, harness.ctx),
+			).then(() => {
+				shutdownSettled = true;
+			});
+			await Promise.resolve();
+			expect(shutdownSettled).toBe(false);
+			release.resolve();
+			await shutdown;
+			expect(fs.existsSync(harness.endpoint())).toBe(false);
+			expect(getTelegramFileSink(harness.sid)).toBeUndefined();
 		} finally {
 			release.resolve();
 			startSpy.mockRestore();
