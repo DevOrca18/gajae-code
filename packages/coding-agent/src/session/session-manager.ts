@@ -821,15 +821,19 @@ function resolveManagedSessionRoot(sessionDir: string, cwd: string): string | un
 	return path.resolve(sessionDir) === path.resolve(resolved.scope.directoryPath) ? sessionsRoot : undefined;
 }
 
+function isSupportedSessionVersion(version: unknown): boolean {
+	return (
+		version === undefined ||
+		(typeof version === "number" && Number.isInteger(version) && version <= CURRENT_SESSION_VERSION)
+	);
+}
+
 /** Exported for compaction.test.ts */
 export function parseSessionEntries(content: string): FileEntry[] {
 	const records = parseJsonlLenient<FileEntry | SessionPatchRecord>(content);
 	const rawHeader = records.find((record): record is SessionHeader => record.type === "session");
-	if (
-		rawHeader?.version !== undefined &&
-		(!Number.isInteger(rawHeader.version) || rawHeader.version > CURRENT_SESSION_VERSION)
-	) {
-		throw new Error(`Unsupported session version: ${String(rawHeader.version)}`);
+	if (!isSupportedSessionVersion(rawHeader?.version)) {
+		throw new Error(`Unsupported session version: ${String(rawHeader?.version)}`);
 	}
 	const entries: FileEntry[] = [];
 	const entriesById = new Map<string, SessionEntry>();
@@ -1856,12 +1860,13 @@ async function getSortedSessions(sessionDir: string, storage: SessionStorage): P
 					const entries = parseJsonlLenient<Record<string, unknown>>(content);
 					if (entries.length === 0) return;
 					const header = entries[0] as Record<string, unknown>;
-					if (header.type !== "session" || typeof header.id !== "string") return;
 					if (
-						typeof header.version === "number" &&
-						header.version >= 4 &&
-						header.version <= CURRENT_SESSION_VERSION
-					) {
+						header.type !== "session" ||
+						typeof header.id !== "string" ||
+						!isSupportedSessionVersion(header.version)
+					)
+						return;
+					if (typeof header.version === "number" && header.version >= 4) {
 						for (const patch of await readSessionListTrailingPatches(path, storage, buffer)) {
 							applySessionListHeaderPatch(header as unknown as SessionListHeader, patch);
 						}

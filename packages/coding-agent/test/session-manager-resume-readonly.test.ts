@@ -216,27 +216,17 @@ describe("SessionManager read-only resume", () => {
 		expect(storage.writes).toBe(0);
 	});
 
-	it("reads v4 entry patches without changing the selected transcript", async () => {
+	it("opens an immutable v4 patch fixture with its final header and message state", async () => {
 		const root = makeTempDir();
 		const sessionDir = path.join(root, "sessions");
 		const filePath = path.join(sessionDir, "v4.jsonl");
-		const records = [
-			{ type: "session", version: 4, id: "v4", timestamp: new Date(0).toISOString(), cwd: root },
-			{
-				type: "message",
-				id: "message",
-				parentId: null,
-				timestamp: new Date(0).toISOString(),
-				message: { role: "user", content: "before patch", timestamp: 0 },
-			},
-			{
-				type: "entry_patch",
-				entryId: "message",
-				patch: { message: { role: "user", content: "after patch", timestamp: 0 } },
-			},
-		];
+		const immutableV4Fixture = `{"type":"session","version":4,"id":"v4","title":"Initial title","timestamp":"1970-01-01T00:00:00.000Z","cwd":"/fixture-v4"}
+{"type":"message","id":"message","parentId":null,"timestamp":"1970-01-01T00:00:01.000Z","message":{"role":"user","content":"before patch","timestamp":0}}
+{"type":"header_patch","patch":{"title":"Patched title","cwd":"/fixture-v4-patched"}}
+{"type":"entry_patch","entryId":"message","patch":{"message":{"role":"user","content":"after patch","timestamp":0}}}
+`;
 		fs.mkdirSync(sessionDir);
-		fs.writeFileSync(filePath, `${records.map(record => JSON.stringify(record)).join("\n")}\n`);
+		fs.writeFileSync(filePath, immutableV4Fixture);
 		const before = fs.readFileSync(filePath);
 		const beforeMtimeNs = fs.statSync(filePath, { bigint: true }).mtimeNs;
 
@@ -245,6 +235,8 @@ describe("SessionManager read-only resume", () => {
 		if (inspection.kind === "error") throw new Error("Expected v4 inspection");
 		const opened = await SessionManager.openExistingStrict(inspection.identity, sessionDir);
 		if (opened.kind === "error") throw new Error("Expected v4 strict open");
+		expect(opened.manager.getHeader()).toMatchObject({ title: "Patched title", cwd: "/fixture-v4-patched" });
+		expect(opened.manager.getCwd()).toBe("/fixture-v4-patched");
 		expect(opened.manager.getEntries()).toMatchObject([
 			{ type: "message", message: { role: "user", content: "after patch" } },
 		]);

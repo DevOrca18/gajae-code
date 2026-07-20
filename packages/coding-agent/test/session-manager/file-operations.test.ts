@@ -97,6 +97,37 @@ describe("findMostRecentSession", () => {
 
 		expect(await findMostRecentSession(tempDir)).toBe(valid);
 	});
+
+	it("skips malformed and future headers when listing, finding, and continuing an explicit directory", async () => {
+		const valid = path.join(tempDir, "valid-v5.jsonl");
+		const malformed = path.join(tempDir, "malformed-version.jsonl");
+		const future = path.join(tempDir, "future-v6.jsonl");
+		fs.writeFileSync(
+			valid,
+			`${JSON.stringify({ type: "session", version: CURRENT_SESSION_VERSION, id: "valid-v5", timestamp: "2025-01-01T00:00:00Z", cwd: tempDir })}\n${JSON.stringify({ type: "message", id: "message", parentId: null, timestamp: "2025-01-01T00:00:01Z", message: { role: "user", content: "valid", timestamp: 1 } })}\n`,
+		);
+		fs.writeFileSync(
+			malformed,
+			`${JSON.stringify({ type: "session", version: 4.5, id: "malformed", timestamp: "2025-01-01T00:00:00Z", cwd: tempDir })}\n`,
+		);
+		fs.writeFileSync(
+			future,
+			`${JSON.stringify({ type: "session", version: CURRENT_SESSION_VERSION + 1, id: "future-v6", timestamp: "2025-01-01T00:00:00Z", cwd: tempDir })}\n`,
+		);
+		fs.utimesSync(valid, new Date(1_000), new Date(1_000));
+		fs.utimesSync(malformed, new Date(2_000), new Date(2_000));
+		fs.utimesSync(future, new Date(3_000), new Date(3_000));
+
+		expect((await getRecentSessions(tempDir)).map(session => session.path)).toEqual([valid]);
+		expect((await SessionManager.list(tempDir, tempDir)).map(session => session.path)).toEqual([valid]);
+		expect(await findMostRecentSession(tempDir)).toBe(valid);
+		const resumed = await SessionManager.continueRecent(tempDir, tempDir);
+		try {
+			expect(resumed.getSessionId()).toBe("valid-v5");
+		} finally {
+			await resumed.close();
+		}
+	});
 });
 
 describe("getRecentSessions", () => {
