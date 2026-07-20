@@ -57,6 +57,10 @@ async function createMinimalSession(
 	const tempDir = path.join(os.tmpdir(), `pi-sdk-goal-tool-${Snowflake.next()}`);
 	tempDirs.push(tempDir);
 	fs.mkdirSync(tempDir, { recursive: true });
+	// Recipe discovery probes project task runners (including `cargo metadata`) and is
+	// outside this activation contract. Keep the focused harness process-free and
+	// cover recipe discovery in its dedicated suite.
+	settings.override("recipe.enabled", false);
 	return createAgentSession({
 		cwd: tempDir,
 		agentDir: tempDir,
