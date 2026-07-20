@@ -125,7 +125,7 @@ describe("createAgentSession defaultInactive tool activation", () => {
 		const namedManager = SessionManager.inMemory();
 		const { session: namedSession } = await createMinimalSession(
 			tempDirs,
-			Settings.isolated({ "tools.discoveryMode": "all" }),
+			Settings.isolated({ "tools.discoveryMode": "all", "tools.essentialOverride": ["read", "bash", "edit"] }),
 			["read", "find", "mcp__docs_search"],
 			namedManager,
 			[createMcpCustomTool("mcp__docs_search", "docs", "search")],
@@ -158,6 +158,25 @@ describe("createAgentSession defaultInactive tool activation", () => {
 			});
 		} finally {
 			await clearedSession.dispose();
+		}
+	});
+
+	it("does not persist essential built-ins as constructor discovery authority", async () => {
+		const sessionManager = SessionManager.inMemory();
+		const { session } = await createMinimalSession(
+			tempDirs,
+			Settings.isolated({ "tools.discoveryMode": "all", "tools.essentialOverride": ["read", "bash", "edit"] }),
+			["read"],
+			sessionManager,
+		);
+		try {
+			expect(session.getActiveToolNames()).toContain("read");
+			expect(sessionManager.buildSessionContext()).toMatchObject({
+				hasPersistedDiscoveredBuiltinToolSelection: false,
+				selectedDiscoveredBuiltinToolNames: undefined,
+			});
+		} finally {
+			await session.dispose();
 		}
 	});
 

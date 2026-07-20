@@ -336,7 +336,7 @@ Extension-provided message that does participate in LLM context. `content` can b
 
 ## Versioning and Migration
 
-Current session version: `4`.
+Current session version: `5`.
 
 ### v1 -> v2
 
@@ -371,13 +371,13 @@ Applied when header `version < 5`:
 
 ### Migration Trigger and Persistence
 
-- v1-v4 transcripts remain readable without mutation during read-only inspection and strict resume selection.
-- Mutable session loads migrate v1-v4 entries in memory and immediately rewrite the complete JSONL file at version 5.
+- v1-v4 transcripts remain readable without mutation during read-only inspection and strict resume selection. Patch records replay for v4 and v5 transcripts; headers with a version greater than 5 are rejected before replay.
+- Mutable loads migrate v1-v4 entries in memory but do not rewrite on read. Migration and the complete v5 rewrite are deferred until the first authorized persistence.
 - v5 sessions load without a migration rewrite. Once v5 data exists, do not roll back to a v4 writer: v4 writers cannot preserve v5 selection authority.
 
 ### Discovery selection authority
 
-MCP and discovered built-in authority are independent. Constructor `toolNames` establishes authority only for the domain it names; a list containing only built-ins does not suppress configured or exact-config MCP defaults, and a list containing only MCP tools does not suppress built-in baselines. An explicit empty list clears both applicable domains. Explicit new-session names and empty clears are persisted as separate domain entries; omitted selections and configured/exact baselines are not authoritative and are not persisted. Resume reconstructs state without appending authority entries.
+MCP and discovered built-in authority are independent. Constructor `toolNames` establishes authority only for the domain it names; currently essential built-ins remain baseline policy and never become discovered-built-in authority. A list containing only non-essential built-ins does not suppress configured or exact-config MCP defaults, and a list containing only MCP tools does not suppress built-in baselines. An explicit empty list clears both applicable domains. Explicit new-session names and empty clears are persisted as separate domain entries; omitted selections, essential baselines, and configured/exact baselines are not authoritative and are not persisted. Resume reconstructs state without appending authority entries.
 
 A combined activation appends an MCP entry first and a discovered-built-in entry second. Both entries carry the same optional `mutationCorrelationId`; older entries without this field remain valid.
 ## Load and Compatibility Behavior

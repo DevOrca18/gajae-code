@@ -2159,6 +2159,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		let initialSelectedDiscoveredBuiltinToolNames: string[] = [];
 		let hasExplicitMCPToolSelection = false;
 		let hasExplicitDiscoveredBuiltinToolSelection = false;
+		let explicitlyRequestedDiscoveredBuiltinToolNames: string[] = [];
 		if (mcpDiscoveryEnabled) {
 			const defaultServerNames = new Set(settings.get("mcp.discoveryDefaultServers") ?? []);
 			for (const tool of toolRegistry.values()) {
@@ -2227,12 +2228,12 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				if (tool.loadMode === "essential") return true;
 				return essentialBuiltinNames.has(name);
 			});
-			const requestedDiscoveredBuiltinToolNames = selectRestorableDiscoveredBuiltinToolNames(
+			explicitlyRequestedDiscoveredBuiltinToolNames = selectRestorableDiscoveredBuiltinToolNames(
 				explicitRequestedToolNames,
 				toolRegistry,
 				allowedDiscoveredBuiltinNames,
-			);
-			const requestedDiscoveredBuiltinToolNameSet = new Set(requestedDiscoveredBuiltinToolNames);
+			).filter(name => !essentialBuiltinNames.has(name));
+			const requestedDiscoveredBuiltinToolNameSet = new Set(explicitlyRequestedDiscoveredBuiltinToolNames);
 			initialBaselineDiscoveredBuiltinToolNames = selectRestorableDiscoveredBuiltinToolNames(
 				baselineInitialToolNames.filter(name => !requestedDiscoveredBuiltinToolNameSet.has(name)),
 				toolRegistry,
@@ -2245,10 +2246,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			);
 			initialSelectedDiscoveredBuiltinToolNames = existingSession.hasPersistedDiscoveredBuiltinToolSelection
 				? restoredDiscoveredNames
-				: requestedDiscoveredBuiltinToolNames;
+				: explicitlyRequestedDiscoveredBuiltinToolNames;
 			initialToolNames = [...new Set([...baselineInitialToolNames, ...initialSelectedDiscoveredBuiltinToolNames])];
 			hasExplicitDiscoveredBuiltinToolSelection =
-				hasExplicitToolNames && (options.toolNames!.length === 0 || requestedDiscoveredBuiltinToolNames.length > 0);
+				hasExplicitToolNames &&
+				(options.toolNames!.length === 0 || explicitlyRequestedDiscoveredBuiltinToolNames.length > 0);
 		}
 
 		// Pre-register in the global agent registry BEFORE building the system prompt,
@@ -2557,13 +2559,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			persistInitialMCPToolSelection: !hasExistingSession && hasExplicitMCPToolSelection,
 			persistInitialDiscoveredBuiltinToolSelection: !hasExistingSession && hasExplicitDiscoveredBuiltinToolSelection,
 			initialPersistedMCPToolNames: explicitlyRequestedMCPToolNames,
-			initialPersistedDiscoveredBuiltinToolNames: selectRestorableDiscoveredBuiltinToolNames(
-				explicitRequestedToolNames,
-				toolRegistry,
-				options.discoverableToolAllowedNames
-					? new Set(options.discoverableToolAllowedNames.map(name => name.toLowerCase()))
-					: undefined,
-			),
+			initialPersistedDiscoveredBuiltinToolNames: explicitlyRequestedDiscoveredBuiltinToolNames,
 			defaultSelectedMCPServerNames: settings.get("mcp.discoveryDefaultServers") ?? [],
 			ttsrManager,
 			obfuscator,
