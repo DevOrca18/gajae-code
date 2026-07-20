@@ -43,7 +43,7 @@ import {
 	theme,
 } from "../../modes/theme/theme";
 import type { InteractiveModeContext, OAuthSelectorOptions } from "../../modes/types";
-import { getNotificationConfig, maskToken } from "../../sdk/bus/config";
+import { getNotificationConfig, isTelegramConfigured, maskToken } from "../../sdk/bus/config";
 import {
 	clearTelegramActivationMarker,
 	createTelegramActivationMarker,
@@ -228,6 +228,13 @@ export interface NotificationsEditorOperationDependencies {
 	saveTelegramInactive: typeof saveTelegramInactive;
 	removeTelegramConfiguration: typeof removeTelegramConfiguration;
 	unregisterNotificationRoot: typeof unregisterNotificationRoot;
+	reloadTelegramDaemon(settings: Settings): Promise<{ ok: boolean; message: string }>;
+	restartTelegramDaemon(settings: Settings): Promise<{ ok: boolean; message: string }>;
+	stopTelegramDaemon(settings: Settings): Promise<{
+		ok: boolean;
+		message: string;
+		before?: { health?: string };
+	}>;
 }
 
 const notificationEditorOperationDependencies: NotificationsEditorOperationDependencies = {
@@ -245,6 +252,11 @@ const notificationEditorOperationDependencies: NotificationsEditorOperationDepen
 	saveTelegramInactive,
 	removeTelegramConfiguration,
 	unregisterNotificationRoot,
+	reloadTelegramDaemon: async settings =>
+		await new TelegramDaemonController(settings).reload({ spawnIfStopped: false }),
+	restartTelegramDaemon: async settings =>
+		await new TelegramDaemonController(settings).reload({ spawnIfStopped: true }),
+	stopTelegramDaemon: async settings => await new TelegramDaemonController(settings).stop(),
 };
 
 function unavailableNotificationSessionStatus(): NotificationSessionStatus {
@@ -333,6 +345,7 @@ export function createNotificationsEditorOperations(
 					sessionScope: config.sessionScope,
 					richEnabled: config.rich.enabled,
 					richDraftEnabled: config.richDraft.enabled,
+					toolActivityEnabled: config.toolActivity.enabled,
 				},
 			};
 		},
@@ -676,14 +689,59 @@ export function createNotificationsEditorOperations(
 		},
 
 		commitPreferences: async preferences => {
+			let daemonWasRunningForDisable = false;
 			try {
-				const receipt = await ctx.settings.commitAtomicBatch([
-					{ path: "notifications.redact", op: "set", value: preferences.redact },
-					{ path: "notifications.verbosity", op: "set", value: preferences.verbosity },
-					{ path: "notifications.sessionScope", op: "set", value: preferences.sessionScope },
-					{ path: "notifications.telegram.rich.enabled", op: "set", value: preferences.richEnabled },
-					{ path: "notifications.telegram.richDraft.enabled", op: "set", value: preferences.richDraftEnabled },
-				]);
+				const before = services.getNotificationConfig(ctx.settings);
+				const disablingToolActivity =
+					isTelegramConfigured(before) && before.toolActivity.enabled && !preferences.toolActivityEnabled;
+				if (disablingToolActivity) {
+					const stopped = await services.stopTelegramDaemon(ctx.settings);
+					if (!stopped.ok)
+						throw new Error(
+							`Notification preferences were not saved because daemon stop failed: ${stopped.message}`,
+						);
+					daemonWasRunningForDisable = stopped.before?.health === "running";
+				}
+
+				let receipt: Awaited<ReturnType<typeof ctx.settings.commitAtomicBatch>>;
+				try {
+					receipt = await ctx.settings.commitAtomicBatch([
+						{ path: "notifications.redact", op: "set", value: preferences.redact },
+						{ path: "notifications.verbosity", op: "set", value: preferences.verbosity },
+						{ path: "notifications.sessionScope", op: "set", value: preferences.sessionScope },
+						{ path: "notifications.telegram.rich.enabled", op: "set", value: preferences.richEnabled },
+						{ path: "notifications.telegram.richDraft.enabled", op: "set", value: preferences.richDraftEnabled },
+						{
+							path: "notifications.telegram.toolActivity.enabled",
+							op: "set",
+							value: preferences.toolActivityEnabled,
+						},
+					]);
+				} catch (error) {
+					if (daemonWasRunningForDisable) {
+						try {
+							const restarted = await services.restartTelegramDaemon(ctx.settings);
+							if (!restarted.ok) throw new Error(restarted.message);
+						} catch (restartError) {
+							const commitMessage = error instanceof Error ? error.message : String(error);
+							const restartMessage = restartError instanceof Error ? restartError.message : String(restartError);
+							throw new Error(
+								`Notification preference commit failed (${commitMessage}) and daemon restart failed (${restartMessage}).`,
+								{ cause: new AggregateError([error, restartError]) },
+							);
+						}
+					}
+					throw error;
+				}
+
+				const config = services.getNotificationConfig(ctx.settings);
+				if (isTelegramConfigured(config)) {
+					const reload = daemonWasRunningForDisable
+						? await services.restartTelegramDaemon(ctx.settings)
+						: await services.reloadTelegramDaemon(ctx.settings);
+					if (!reload.ok)
+						throw new Error(`Notification preferences were saved, but daemon reload failed: ${reload.message}`);
+				}
 				await notifyAfterDurableCommit();
 				return { receipt, message: "Notification preferences saved atomically." };
 			} catch (error) {
