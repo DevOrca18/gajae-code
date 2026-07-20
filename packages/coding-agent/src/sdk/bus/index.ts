@@ -33,10 +33,11 @@ import { NotificationServer, nativeBuildInfo } from "@gajae-code/natives";
 import { logger, postmortem, prompt, VERSION } from "@gajae-code/utils";
 import { Settings } from "../../config/settings";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "../../extensibility/extensions";
-import type {
-	WorkflowGateEmitter,
-	WorkflowGateTerminalController,
-	WorkflowGateTerminalProof,
+import {
+	NotificationGatePolicyChangedError,
+	type WorkflowGateEmitter,
+	type WorkflowGateTerminalController,
+	type WorkflowGateTerminalProof,
 } from "../../modes/shared/agent-wire/workflow-gate-broker";
 import btwUserPrompt from "../../prompts/system/btw-user.md" with { type: "text" };
 import { parseThinkingLevel } from "../../thinking";
@@ -81,6 +82,7 @@ import { imageAttachmentsFromMessage, notificationActionPayload, summaryFromMess
 import { assertNativeRuntimeCompatibility } from "./native-runtime-compatibility";
 import { NotificationSessionController, type NotificationSessionRuntime } from "./session-control";
 import {
+	ASK_SELECTED_ACK_CAPABILITY,
 	type EnsureDaemonResult,
 	endpointAuthorityDigest,
 	ensureTelegramDaemonRunningDetailed,
@@ -880,6 +882,12 @@ interface SessionRuntime {
 	workflowGate?: WorkflowGateEmitter;
 	gatePresentations?: PresentationArbiter;
 	redact: boolean;
+	/** Last stable policy's redaction state, retained while provisional policy is held. */
+	committedRedact: boolean;
+	/** Provisional policy suppresses delivery without changing committed-side effects. */
+	policySuspended: boolean;
+	/** Monotonic policy epoch fences asynchronous notification delivery. */
+	policyGeneration: number;
 	/** True only after the exact host generation was registered with the broker index. */
 	brokerRegistrationActive: boolean;
 	/** Terminal cleanup proof retained across retries; each owner is released at most once after proof. */
@@ -926,6 +934,12 @@ interface SessionRuntime {
 	/** True between turn_end and the next turn_start: drops late async message_update
 	 * frames so a stale live edit can never be emitted after the finalized turn. */
 	turnClosed?: boolean;
+	/** Finalized while provisional policy was held; flush exactly once on stable activation. */
+	pendingFinal?: { text?: string; messageRef?: string };
+	/** Durable gates emitted while ownership is provisional; presented only after stable activation. */
+	deferredGatePresentations: Array<() => void>;
+	/** SDK control frames received during provisional ownership; replayed only after stable activation. */
+	deferredInboundControls: Array<() => void>;
 	/** Started tool calls awaiting a terminal activity frame, keyed by tool call id. */
 	inFlightTools: Map<string, { toolName: string; args: unknown }>;
 	/** Cancels the postmortem cleanup that emits `session_closed` on process teardown. */
@@ -1050,6 +1064,7 @@ const defaultConfig: NotificationConfig = {
 	rich: { enabled: true },
 	richDraft: { enabled: false },
 	toolActivity: { enabled: true },
+	streaming: { enabled: true },
 	topics: {},
 	btw: { enabled: true },
 };
@@ -1058,13 +1073,6 @@ export function notificationsEnabled(): boolean {
 	return process.env.GJC_NOTIFICATIONS === "1" || Boolean(process.env.GJC_NOTIFICATIONS_TOKEN);
 }
 
-// Live streaming (opt-in): emit throttled non-finalized `turn_stream` frames as
-// the assistant message streams so remote clients can edit ONE message live. The
-// finalized frame (turn_end) carries the same messageRef and stays authoritative,
-// so a dropped live frame self-heals. Off unless GJC_NOTIFICATIONS_STREAM=1.
-function streamingEnabled(): boolean {
-	return process.env.GJC_NOTIFICATIONS_STREAM === "1";
-}
 function streamIntervalMs(): number {
 	return Math.max(200, Number(process.env.GJC_NOTIFICATIONS_STREAM_INTERVAL_MS) || 500);
 }
@@ -2749,6 +2757,8 @@ export function createNotificationsExtension(
 		runEphemeralTurn?: (promptText: string, signal: AbortSignal) => Promise<{ replyText: string }>;
 		/** Observes settlement of optional session-branch startup after reconciliation completes. */
 		onBranchStartupSettled?: (receipt: { sessionId: string; status: SessionStartResult["status"] }) => void;
+		readNotificationFile?: (path: string) => Promise<Buffer>;
+		readNotificationDiffStat?: (cwd: string) => Promise<string | undefined>;
 	} = {},
 ): void {
 	const lifecycleStartupCapability = lifecycleStartupCapabilityForApi(api);
@@ -2959,6 +2969,16 @@ export function createNotificationsExtension(
 		return ctx.sessionMetadata?.kind !== "sub";
 	}
 
+	function canDeliverAsync(runtime: SessionRuntime, generation: number): boolean {
+		return (
+			runtimes.get(runtime.id) === runtime &&
+			!runtime.stopping &&
+			runtime.notificationsActive &&
+			!runtime.redact &&
+			runtime.policyGeneration === generation
+		);
+	}
+
 	async function startSession(ctx: ExtensionContext): Promise<SessionStartResult> {
 		const id = sessionId(ctx);
 		const lifecycleRequestId = safeLifecycleRequestId(process.env.GJC_LIFECYCLE_REQUEST_ID);
@@ -3012,8 +3032,6 @@ export function createNotificationsExtension(
 		const pendingInteractive = new Map<string, PendingInteractiveAsk>();
 		const pendingPromptCorrelations: Array<{ commandId: string; turnId: string }> = [];
 		const tag = sessionTag(id);
-		const redact = cfg.redact;
-		const verbosity = cfg.verbosity;
 		let runtime: SessionRuntime | undefined;
 
 		// The SDK can always answer now (interactive via the answer source, or the
@@ -3033,7 +3051,7 @@ export function createNotificationsExtension(
 			if (lifecycleRequired) return failLifecycleStartup("failed", error);
 			throw error;
 		}
-		const gatePresentations = new PresentationArbiter(server, () => runtime?.redact ?? redact, tag);
+		const gatePresentations = new PresentationArbiter(server, () => runtime?.redact ?? true, tag);
 		let inboundSdkFrame: ((connectionId: string, frame: Record<string, unknown>) => void) | undefined;
 		const inFlightGateResolutions = new Set<Promise<void>>();
 		const trackGateResolution = <T>(resolution: Promise<T>): Promise<T> => {
@@ -3473,9 +3491,12 @@ export function createNotificationsExtension(
 			disableEphemeralTurns: () => {},
 			cancelPostmortemCleanup: () => {},
 
-			redact,
-			verbosity,
-			stream: streamingEnabled(),
+			redact: true,
+			committedRedact: true,
+			policySuspended: true,
+			verbosity: "lean",
+			stream: false,
+			policyGeneration: 0,
 			sessionTag: tag,
 			busy: false,
 			pendingPromptCorrelations,
@@ -3484,6 +3505,8 @@ export function createNotificationsExtension(
 			emitPromptLifecycle,
 			pendingInbound: new Set<number>(),
 			inFlightTools: new Map<string, { toolName: string; args: unknown }>(),
+			deferredGatePresentations: [],
+			deferredInboundControls: [],
 		};
 		const initializedRuntime = runtime;
 		runtimes.set(id, initializedRuntime);
@@ -3522,7 +3545,16 @@ export function createNotificationsExtension(
 
 		const ephemeralTurns = new EphemeralTurnHost(sendSdkFrame, async (question, signal) => {
 			if (!options.runEphemeralTurn) throw new Error("Ephemeral turns are unavailable.");
-			return await options.runEphemeralTurn(prompt.render(btwUserPrompt, { question }), signal);
+			const generation = initializedRuntime.policyGeneration;
+			if (initializedRuntime.policySuspended) throw new Error("Notification policy is provisional.");
+			const result = await options.runEphemeralTurn(prompt.render(btwUserPrompt, { question }), signal);
+			if (
+				initializedRuntime.policySuspended ||
+				initializedRuntime.policyGeneration !== generation ||
+				runtimes.get(id) !== initializedRuntime
+			)
+				throw new Error("Notification policy changed during the ephemeral turn.");
+			return result;
 		});
 		initializedRuntime.abortEphemeralTurns = () => ephemeralTurns.dispose();
 		initializedRuntime.disableEphemeralTurns = () => ephemeralTurns.disable();
@@ -3560,12 +3592,18 @@ export function createNotificationsExtension(
 
 			server.onReply((err, reply) => {
 				if (err || !reply) return;
-				if (runtime?.stopping || runtimes.get(id) !== runtime) {
+				if (runtime?.stopping || runtime?.policySuspended || runtimes.get(id) !== runtime) {
 					try {
 						server.closeClaimInvalid(reply.replyReceiptId, "session_stopping");
 					} catch {}
 					return;
 				}
+				const replyGeneration = runtime.policyGeneration;
+				const replyIsCurrent = (): boolean =>
+					runtimes.get(id) === runtime &&
+					!runtime.stopping &&
+					!runtime.policySuspended &&
+					runtime.policyGeneration === replyGeneration;
 				const native = server as unknown as {
 					resolveClaim(receiptId: string, answerJson?: string, idempotencyKey?: string): void;
 					closeClaimInvalid(receiptId: string, reason: string): void;
@@ -3607,6 +3645,13 @@ export function createNotificationsExtension(
 						settle(settlement: AskSettlement): Promise<AskSettlementResult> {
 							if (settled) return settled;
 							settled = Promise.resolve().then(async () => {
+								if (!replyIsCurrent()) {
+									try {
+										native.closeClaimInvalid(reply.replyReceiptId, "policy_changed");
+									} catch {}
+									pending.fail(reply.id);
+									return { kind: "invalid_closed" };
+								}
 								if (settlement.kind === "invalid") {
 									try {
 										native.closeClaimInvalid(reply.replyReceiptId, settlement.reason);
@@ -3633,6 +3678,11 @@ export function createNotificationsExtension(
 										commitKey: `${reply.id}:${reply.idempotencyKey ?? reply.replyReceiptId}`,
 										deadlineAt: Date.now() + 8_000,
 									});
+									if (!replyIsCurrent()) {
+										native.closeClaimInvalid(reply.replyReceiptId, "policy_changed");
+										pending.fail(reply.id);
+										return { kind: "invalid_closed" };
+									}
 									native.resolveClaim(
 										reply.replyReceiptId,
 										reply.answerJson,
@@ -3718,24 +3768,33 @@ export function createNotificationsExtension(
 								replyReceiptId: reply.replyReceiptId,
 								answerJson: reply.answerJson,
 								idempotencyKey: reply.idempotencyKey ?? undefined,
-								resolveClaim: () =>
+								resolveClaim: () => {
+									if (!replyIsCurrent()) {
+										native.closeClaimInvalid(reply.replyReceiptId, "policy_changed");
+										throw new NotificationGatePolicyChangedError();
+									}
 									native.resolveClaim(
 										reply.replyReceiptId,
 										reply.answerJson,
 										reply.idempotencyKey ?? undefined,
-									),
+									);
+								},
 								closeClaimInvalid: reason => {
 									native.closeClaimInvalid(reply.replyReceiptId, reason);
 									gatePresentations.closeInteraction(reply.id, reason);
 									gatePresentations.reconcile();
 								},
-								requestSelectedAck: input =>
-									requestLiveSelectedAck(native, {
+								requestSelectedAck: async input => {
+									if (!replyIsCurrent()) throw new NotificationGatePolicyChangedError();
+									const ack = await requestLiveSelectedAck(native, {
 										replyReceiptId: input.replyReceiptId,
 										actionId: input.actionId,
 										commitKey: input.commitKey,
 										deadlineAt: input.daemonDeadlineAt,
-									}),
+									});
+									if (!replyIsCurrent()) throw new NotificationGatePolicyChangedError();
+									return ack;
+								},
 							},
 						)
 						.catch(() => {
@@ -3780,6 +3839,26 @@ export function createNotificationsExtension(
 					messageId?: number;
 					reason?: string;
 				};
+				const notificationOrigin = hostCapCache
+					.get(authenticatedInbound.connectionId)
+					?.has(ASK_SELECTED_ACK_CAPABILITY);
+				if (runtime?.policySuspended && notificationOrigin) {
+					if (inbound.kind === "control_command") {
+						const frame = sdkInboundFrame(inbound.commandJson);
+						if (frame) {
+							const suspendedRuntime = runtime;
+							runtime.deferredInboundControls.push(() => {
+								if (
+									runtimes.get(id) === suspendedRuntime &&
+									!suspendedRuntime.stopping &&
+									!suspendedRuntime.policySuspended
+								)
+									inboundSdkFrame?.(`seam:${inbound.requestId ?? "notification"}`, frame);
+							});
+						}
+					}
+					return;
+				}
 				if (inbound.kind === "control_command") {
 					const frame = sdkInboundFrame(inbound.commandJson);
 					if (frame) {
@@ -3839,6 +3918,7 @@ export function createNotificationsExtension(
 				}
 				if (inbound.kind === "config_command") {
 					if (!runtime) return;
+					if (runtime.policySuspended) return;
 					const update: {
 						type: "config_update";
 						sessionId: string;
@@ -3853,16 +3933,15 @@ export function createNotificationsExtension(
 						update.verbosity = inbound.verbosity;
 					}
 					if (typeof inbound.redact === "boolean") {
-						// Redact turning ON: terminalize any already-visible in-flight tool
-						// bubbles (while redact is still off so the helper emits) so they never
-						// strand permanently in "started"; subsequent detail is then suppressed.
-						if (inbound.redact && !runtime.redact) {
+						if (inbound.redact && !runtime.committedRedact) {
 							terminalizeInFlightTools(runtime, runtime.id, "unknown");
 						}
+						runtime.committedRedact = inbound.redact;
 						runtime.redact = inbound.redact;
 						update.redact = inbound.redact;
 					}
 					if (update.verbosity !== undefined || update.redact !== undefined) {
+						runtime.policyGeneration++;
 						try {
 							pushSessionFrame(runtime, update);
 						} catch (error) {
@@ -4009,9 +4088,13 @@ export function createNotificationsExtension(
 					gatePresentations,
 				);
 				runtime.disposeFileSink = registerTelegramFileSink(runtime.id, async file => {
-					if (runtime.redact) return { ok: false, error: TELEGRAM_FILE_REDACTION_ERROR };
+					const generation = runtime.policyGeneration;
+					if (!canDeliverAsync(runtime, generation)) return { ok: false, error: TELEGRAM_FILE_REDACTION_ERROR };
 					try {
-						const data = await fs.promises.readFile(file.path);
+						const data = await (options.readNotificationFile ?? fs.promises.readFile)(file.path);
+						if (!canDeliverAsync(runtime, generation)) {
+							return { ok: false, error: TELEGRAM_FILE_REDACTION_ERROR };
+						}
 						pushFileAttachment(
 							runtime,
 							{
@@ -4072,7 +4155,11 @@ export function createNotificationsExtension(
 						logger.warn(`notifications: gate terminal controller unavailable: ${String(error)}`);
 					}
 				}
-				activeRuntime.disposeGateListener = gate.onGateEmitted(g => {
+				const presentGate = (
+					g: Parameters<NonNullable<WorkflowGateEmitter["onGateEmitted"]>>[0] extends (gate: infer Gate) => void
+						? Gate
+						: never,
+				): void => {
 					const options = (g.options ?? []).map(o => String((o as { label?: unknown }).label ?? ""));
 					gateOptions.set(g.gate_id, options);
 					const promptCtx = g.context as { prompt?: unknown; title?: unknown } | undefined;
@@ -4096,6 +4183,13 @@ export function createNotificationsExtension(
 						navigationLabel: stageState.navigation_label === "Next" ? "Next" : "Done",
 						selectedOptions: [],
 					});
+				};
+				activeRuntime.disposeGateListener = gate.onGateEmitted(g => {
+					if (activeRuntime.policySuspended) {
+						activeRuntime.deferredGatePresentations.push(() => presentGate(g));
+						return;
+					}
+					presentGate(g);
 				});
 				if (gate.setAckRecoveryParticipant) {
 					const native = server as unknown as {
@@ -4104,13 +4198,19 @@ export function createNotificationsExtension(
 						): Promise<{ status: string; messageId?: number; reason?: string }>;
 					};
 					gate.setAckRecoveryParticipant({
-						requestRecoveredAskSelectedAck: input =>
-							requestRecoveredSelectedAck(native, {
+						requestRecoveredAskSelectedAck: async input => {
+							const generation = activeRuntime.policyGeneration;
+							if (activeRuntime.policySuspended) return { status: "failed", reason: "cancelled" };
+							const outcome = await requestRecoveredSelectedAck(native, {
 								sessionId: input.sessionId,
 								actionId: input.actionId,
 								commitKey: input.commitKey,
 								deadlineAt: input.deadlineAt,
-							}),
+							});
+							if (activeRuntime.policySuspended || activeRuntime.policyGeneration !== generation)
+								return { status: "failed", reason: "cancelled" };
+							return outcome;
+						},
 					});
 					activeRuntime.disposeAckRecoveryParticipant = () => gate.setAckRecoveryParticipant?.(null);
 				}
@@ -4120,7 +4220,6 @@ export function createNotificationsExtension(
 			};
 			activeRuntime.disposeGateEmitterListener = registerWorkflowGateEmitterListener(id, attachWorkflowGate);
 			if (ctx.workflowGate) attachWorkflowGate(ctx.workflowGate);
-			if (notificationsEnabledForSession) initializedRuntime.enableNotifications();
 			finishStartup({ status: "started", runtime: initializedRuntime });
 			return { status: "started", runtime: initializedRuntime };
 		} catch (e) {
@@ -4152,25 +4251,51 @@ export function createNotificationsExtension(
 				if (!runtime || sessionId(binding.context) !== binding.sessionId || activeRuntimeId !== binding.sessionId) {
 					return "failed";
 				}
-				runtime.enableNotifications();
 				return "started";
 			}
 			const runtime = runtimes.get(binding.sessionId);
 			if (runtime) {
-				runtime.enableNotifications();
 				return "started";
 			}
 			const result = await startSession(binding.context);
 			return result.status === "started" || result.status === "already" ? "started" : result.status;
 		},
 		stop: async binding => await stopSession(binding.sessionId, "notifications"),
+		refreshPolicy: (binding, policy) => {
+			const runtime = runtimes.get(binding.sessionId);
+			if (!runtime) return;
+			if (policy.mode === "provisional") {
+				runtime.policyGeneration++;
+				runtime.policySuspended = true;
+				runtime.redact = true;
+				runtime.verbosity = "lean";
+				runtime.stream = false;
+				return;
+			}
+			const redactionEnabled = policy.redact && !runtime.committedRedact;
+			runtime.policyGeneration++;
+			runtime.committedRedact = policy.redact;
+			runtime.policySuspended = false;
+			runtime.redact = policy.redact;
+			runtime.verbosity = policy.verbosity;
+			runtime.stream = policy.stream;
+			if (redactionEnabled) terminalizeInFlightTools(runtime, runtime.id, "unknown");
+		},
+		activate: binding => {
+			const runtime = runtimes.get(binding.sessionId);
+			if (!runtime || runtime.stopping) return;
+			runtime.enableNotifications();
+			flushPendingFinal(runtime, runtime.id);
+			for (const present of runtime.deferredGatePresentations.splice(0)) present();
+			for (const processControl of runtime.deferredInboundControls.splice(0)) processControl();
+		},
 		ensureTelegramDaemon: async binding => {
 			const { settings, settingsAvailable } = resolveSettings(options.settings);
 			if (!settingsAvailable || !settings) return "blocked_identity";
 			try {
 				return await ensureTelegramOwner(settings, binding.cwd, binding.sessionId);
 			} catch {
-				return "blocked_identity";
+				return "failed";
 			}
 		},
 	};
@@ -4221,16 +4346,17 @@ export function createNotificationsExtension(
 				const result = await controller.setLocalEnabled(ctx, true);
 				const enabled = result.status.running && result.status.effectiveEnabled;
 				const rotated = sessionId(ctx) !== id;
+				if (rotated) await stopSession(id);
 				const failed = result.outcome === "failed" || (!enabled && !rotated && activeRuntimeId !== id);
 				ctx.ui.notify(
-					enabled
-						? "Notifications enabled for this session."
-						: rotated
-							? "Notifications were not enabled because the active session changed during startup."
+					rotated
+						? "Notifications were not enabled because the active session changed during startup."
+						: enabled
+							? "Notifications enabled for this session."
 							: failed
 								? "Notifications failed to start for this session."
 								: "Notifications were not enabled because daemon ownership could not be proved.",
-					enabled ? "info" : rotated ? "warning" : failed ? "error" : "warning",
+					rotated ? "warning" : enabled ? "info" : failed ? "error" : "warning",
 				);
 				return;
 			}
@@ -4375,6 +4501,36 @@ export function createNotificationsExtension(
 		rt.inFlightTools.clear();
 	};
 
+	const resetTurnStreamState = (rt: SessionRuntime): void => {
+		rt.currentTurnText = undefined;
+		rt.preAskFlushedText = undefined;
+		rt.liveRef = undefined;
+		rt.turnClosed = true;
+		rt.lastLiveAt = undefined;
+		rt.lastLiveText = undefined;
+	};
+
+	const flushPendingFinal = (rt: SessionRuntime, id: string): void => {
+		const pending = rt.pendingFinal;
+		if (!pending) return;
+		rt.pendingFinal = undefined;
+		if (pending.text && rt.notificationsActive && !rt.redact) {
+			try {
+				pushSessionFrame(rt, {
+					type: "turn_stream",
+					sessionId: id,
+					phase: "finalized",
+					finalAnswer: true,
+					text: pending.text,
+					...(pending.messageRef ? { messageRef: pending.messageRef } : {}),
+				});
+			} catch (error) {
+				logger.warn(`notifications: pushFrame (pending turn) failed: ${String(error)}`);
+			}
+		}
+		resetTurnStreamState(rt);
+	};
+
 	// Drive the live typing indicator: mark busy when the agent loop starts so
 	// the daemon shows "typing…" in the thread while the agent is thinking,
 	// before any turn output exists. Cleared on `agent_end` below.
@@ -4486,7 +4642,9 @@ export function createNotificationsExtension(
 			const model = (ctx as { getModel?: () => { id?: string } | undefined }).getModel?.();
 			const tokenUsage = usage && usage.tokens != null ? `${usage.tokens}/${usage.contextWindow}` : undefined;
 			const modelId = model?.id;
-			void readGitDiffStat(ctx.cwd).then(diff => {
+			const generation = rt.policyGeneration;
+			void (options.readNotificationDiffStat ?? readGitDiffStat)(ctx.cwd).then(diff => {
+				if (!canDeliverAsync(rt, generation)) return;
 				const cwd = compactCwd(ctx.cwd);
 				if (!diff && !tokenUsage && !modelId && !cwd) return;
 				try {
@@ -4514,7 +4672,7 @@ export function createNotificationsExtension(
 	// Push the in-flight turn's assistant text as a finalized turn_stream, deduped
 	// against what was already flushed for this turn (the pre-ask lead-in).
 	const flushTurnText = (rt: SessionRuntime, id: string, text: string | undefined, finalAnswer: boolean): void => {
-		if (!text || text === rt.preAskFlushedText || !rt.notificationsActive) return;
+		if (!text || text === rt.preAskFlushedText || !rt.notificationsActive || rt.policySuspended) return;
 		rt.preAskFlushedText = text;
 		// Decision A: a stream-enabled turn must finalize as an in-place edit of ONE
 		// live message, never a fresh (rich-promotable) send. If live frames were
@@ -4644,18 +4802,20 @@ export function createNotificationsExtension(
 		const id = sessionId(ctx);
 		const rt = runtimes.get(id);
 		if (!rt?.notificationsActive) return;
-		const text = rt.redact ? undefined : summaryFromMessage(event.message, turnTextMax());
+		const text = rt.policySuspended
+			? rt.committedRedact
+				? undefined
+				: summaryFromMessage(event.message, turnTextMax())
+			: rt.redact
+				? undefined
+				: summaryFromMessage(event.message, turnTextMax());
+		if (rt.policySuspended) {
+			rt.pendingFinal = { text, messageRef: rt.liveRef };
+			rt.turnClosed = true;
+			return;
+		}
 		if (text) flushTurnText(rt, id, text, true);
-		// Reset per-turn streaming state so the next turn starts fresh and a later
-		// turn with identical text is not falsely deduped.
-		rt.currentTurnText = undefined;
-		rt.preAskFlushedText = undefined;
-		rt.liveRef = undefined;
-		// Close the live-stream window: any message_update queued after turn_end is
-		// dropped so it can never emit a stale live edit past the finalized turn.
-		rt.turnClosed = true;
-		rt.lastLiveAt = undefined;
-		rt.lastLiveText = undefined;
+		resetTurnStreamState(rt);
 	});
 
 	// Live streaming (opt-in): push throttled in-progress assistant text as

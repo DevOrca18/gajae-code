@@ -3,6 +3,7 @@
 ## [Unreleased]
 ### Fixed
 - Restored the canonical public CLI command-surface contract for the independently documented `gjc memory` filesystem/MAP command after its feature merge omitted the expected command-list update.
+- Filesystem/MAP `memory doctor` now treats intentionally uninitialized scopes as absent instead of making partial-scope opt-in permanently unhealthy; explicit policy denials and real document/MAP safety findings remain reported.
 - Added evidence-preserving recovery for legacy multi-writer SDK session-index corruption: `gjc gc` now diagnoses corrupt prefixes, `--repair-session-index` quarantines the original snapshot/log under the session-index lock before atomically restoring only the checksum-valid monotonic prefix, and append failures point operators to the explicit repair path (#2654).
 - Preserved access to legal SQLite table names beginning with `sqlite` but not reserved `sqlite_`.
 - Malformed selectors on internal read URLs now fail explicitly instead of silently falling back to an unbounded resource read.
@@ -14,6 +15,9 @@
 
 - Activated discoverable built-in tools now persist with independent MCP and discovered-built-in authority, preserving explicit empty selections and restoring only eligible built-ins across resumed lifecycle transitions.
 - Session files now use v5 authority records. Do not roll back to a v4 writer after v5 session data has been created: v4 writers cannot preserve independent MCP and discovered-built-in selections.
+
+### Changed
+- Telegram live-message streaming now defaults on for configured Telegram notifications through one durable global preference, supports live in-session preference refresh without weakening redaction, and keeps Discord and Slack finalized-only; process environment overrides remain available.
 
 ## [0.11.3] - 2026-07-19
 ### Added
