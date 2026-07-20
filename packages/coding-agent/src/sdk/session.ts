@@ -2243,6 +2243,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				existingSession.selectedDiscoveredBuiltinToolNames ?? [],
 				toolRegistry,
 				allowedDiscoveredBuiltinNames,
+				essentialBuiltinNames,
 			);
 			initialSelectedDiscoveredBuiltinToolNames = existingSession.hasPersistedDiscoveredBuiltinToolSelection
 				? restoredDiscoveredNames

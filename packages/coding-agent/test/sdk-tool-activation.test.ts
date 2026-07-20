@@ -271,7 +271,7 @@ describe("createAgentSession defaultInactive tool activation", () => {
 		}
 	});
 
-	it("preserves SDK baseline ownership when target context clears overlapping selection", async () => {
+	it("keeps a restored now-essential built-in active as baseline rather than discovery authority", async () => {
 		const sessionManager = SessionManager.inMemory();
 		const targetEntryId = sessionManager.appendMessage({
 			role: "user",
@@ -287,7 +287,9 @@ describe("createAgentSession defaultInactive tool activation", () => {
 		);
 
 		try {
-			expect(session.getSelectedDiscoveredToolNames()).toContain("find");
+			expect(session.getSelectedDiscoveredToolNames()).not.toContain("find");
+			expect(session.getActiveToolNames()).toContain("find");
+			expect(session.systemPrompt.join("\n")).toContain("find");
 			const result = await session.branch(targetEntryId);
 			expect(result.cancelled).toBe(false);
 			expect(session.getSelectedDiscoveredToolNames()).not.toContain("find");

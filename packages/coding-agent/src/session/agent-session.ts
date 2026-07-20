@@ -298,6 +298,7 @@ import {
 	selectRestorableDiscoveredBuiltinToolNames,
 } from "../tool-discovery/tool-index";
 import type { AskAnswerSource, ToolSession } from "../tools";
+import { computeEssentialBuiltinNames } from "../tools";
 import { AskTool } from "../tools/ask";
 import {
 	getAskAnswerSource as getAskAnswerSourceFromRegistry,
@@ -2132,11 +2133,7 @@ export class AgentSession {
 		this.#setDiscoverableMCPTools(this.#collectDiscoverableMCPToolsFromRegistry());
 		this.#selectedMCPToolNames = new Set(config.initialSelectedMCPToolNames ?? []);
 		this.#selectedDiscoveredToolNames = new Set(
-			selectRestorableDiscoveredBuiltinToolNames(
-				config.initialSelectedDiscoveredBuiltinToolNames ?? [],
-				this.#toolRegistry,
-				this.#discoverableToolAllowedNames,
-			),
+			this.#selectRestorableDiscoveredBuiltinToolNames(config.initialSelectedDiscoveredBuiltinToolNames ?? []),
 		);
 		this.#baselineDiscoveredBuiltinToolNames = new Set(
 			selectRestorableDiscoveredBuiltinToolNames(
@@ -2153,11 +2150,7 @@ export class AgentSession {
 				: undefined;
 		this.#constructorDiscoveredBuiltinToolSelection =
 			config.initialDiscoveredBuiltinToolSelectionIsExplicit === true
-				? selectRestorableDiscoveredBuiltinToolNames(
-						config.initialPersistedDiscoveredBuiltinToolNames ?? [],
-						this.#toolRegistry,
-						this.#discoverableToolAllowedNames,
-					)
+				? this.#selectRestorableDiscoveredBuiltinToolNames(config.initialPersistedDiscoveredBuiltinToolNames ?? [])
 				: undefined;
 		this.#pruneSelectedMCPToolNames();
 		const persistInitialMCPToolSelection =
@@ -5142,13 +5135,18 @@ export class AgentSession {
 			: undefined;
 	}
 
+	#selectRestorableDiscoveredBuiltinToolNames(toolNames: Iterable<string>): string[] {
+		return selectRestorableDiscoveredBuiltinToolNames(
+			toolNames,
+			this.#toolRegistry,
+			this.#discoverableToolAllowedNames,
+			new Set(computeEssentialBuiltinNames(this.settings)),
+		);
+	}
+
 	#resolveConstructorDiscoveredBuiltinToolSelection(): string[] | undefined {
 		return this.#constructorDiscoveredBuiltinToolSelection
-			? selectRestorableDiscoveredBuiltinToolNames(
-					this.#constructorDiscoveredBuiltinToolSelection,
-					this.#toolRegistry,
-					this.#discoverableToolAllowedNames,
-				)
+			? this.#selectRestorableDiscoveredBuiltinToolNames(this.#constructorDiscoveredBuiltinToolSelection)
 			: undefined;
 	}
 
@@ -5158,11 +5156,9 @@ export class AgentSession {
 	}
 
 	#getSelectedDiscoveredBuiltinToolNames(): string[] {
-		return selectRestorableDiscoveredBuiltinToolNames(
-			this.#selectedDiscoveredToolNames,
-			this.#toolRegistry,
-			this.#discoverableToolAllowedNames,
-		).filter(name => this.getActiveToolNames().includes(name));
+		return this.#selectRestorableDiscoveredBuiltinToolNames(this.#selectedDiscoveredToolNames).filter(name =>
+			this.getActiveToolNames().includes(name),
+		);
 	}
 
 	#persistSelectedMCPToolNamesIfChanged(
@@ -5785,11 +5781,7 @@ export class AgentSession {
 			: (constructorMCPToolNames ?? this.#getConfiguredDefaultSelectedMCPToolNames());
 		const constructorDiscoveredBuiltinToolNames = this.#resolveConstructorDiscoveredBuiltinToolSelection();
 		const restoredDiscoveredBuiltinToolNames = sessionContext.hasPersistedDiscoveredBuiltinToolSelection
-			? selectRestorableDiscoveredBuiltinToolNames(
-					sessionContext.selectedDiscoveredBuiltinToolNames ?? [],
-					this.#toolRegistry,
-					this.#discoverableToolAllowedNames,
-				)
+			? this.#selectRestorableDiscoveredBuiltinToolNames(sessionContext.selectedDiscoveredBuiltinToolNames ?? [])
 			: (constructorDiscoveredBuiltinToolNames ?? []);
 		this.#selectedDiscoveredToolNames = new Set(restoredDiscoveredBuiltinToolNames);
 		await this.#applyActiveToolsByName(

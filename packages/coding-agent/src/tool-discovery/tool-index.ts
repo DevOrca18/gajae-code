@@ -65,17 +65,19 @@ export function isMCPToolName(name: string): boolean {
 	return name.startsWith("mcp__");
 }
 
-/** Select persisted built-in discoveries that remain eligible in the current registry and allowlist. */
+/** Select persisted built-in discoveries that remain eligible in the current registry, allowlist, and baseline policy. */
 export function selectRestorableDiscoveredBuiltinToolNames(
 	toolNames: Iterable<string>,
 	toolRegistry: ReadonlyMap<string, AgentTool>,
 	allowedNames?: ReadonlySet<string>,
+	excludedNames?: ReadonlySet<string>,
 ): string[] {
 	const selected: string[] = [];
 	for (const name of toolNames) {
 		const tool = toolRegistry.get(name);
 		if (tool?.loadMode !== "discoverable") continue;
 		if (allowedNames && !allowedNames.has(name)) continue;
+		if (excludedNames?.has(name)) continue;
 		if (!selected.includes(name)) selected.push(name);
 	}
 	return selected;

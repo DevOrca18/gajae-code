@@ -124,6 +124,7 @@ All non-header entries include:
 - `session_init`
 - `mode_change`
 - `mcp_tool_selection`
+- `discovered_builtin_tool_selection`
 
 ### `message`
 
@@ -305,6 +306,21 @@ Extension-provided message that does participate in LLM context. `content` can b
   "selectedToolNames": ["server.tool"]
 }
 ```
+
+### `discovered_builtin_tool_selection`
+
+```json
+{
+  "type": "discovered_builtin_tool_selection",
+  "id": "e2f3g4h5",
+  "parentId": "d2e3f4a5",
+  "timestamp": "2026-02-16T10:28:31.000Z",
+  "selectedToolNames": ["search_tool_bm25"],
+  "mutationCorrelationId": "4c2b9c60-20d7-4a18-8d2a-8edc1f892b89"
+}
+```
+
+`selectedToolNames` is the explicit discovered built-in selection. `mutationCorrelationId` is optional and correlates adjacent MCP and discovered built-in selection records from one mutation.
 
 ### `session_init`
 
