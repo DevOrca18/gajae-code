@@ -2157,6 +2157,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		let defaultSelectedMCPToolNames: string[] = [];
 		let initialBaselineDiscoveredBuiltinToolNames: string[] = [];
 		let initialSelectedDiscoveredBuiltinToolNames: string[] = [];
+		let hasExplicitMCPToolSelection = false;
+		let hasExplicitDiscoveredBuiltinToolSelection = false;
 		if (mcpDiscoveryEnabled) {
 			const defaultServerNames = new Set(settings.get("mcp.discoveryDefaultServers") ?? []);
 			for (const tool of toolRegistry.values()) {
@@ -2182,9 +2184,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					...(explicitMcpConfigPath !== undefined ? exactMcpToolNames : []),
 				]),
 			];
+			hasExplicitMCPToolSelection =
+				hasExplicitToolNames && (options.toolNames!.length === 0 || explicitlyRequestedMCPToolNames.length > 0);
 			initialSelectedMCPToolNames = existingSession.hasPersistedMCPToolSelection
 				? restoredSelectedMCPToolNames
-				: hasExplicitToolNames
+				: hasExplicitMCPToolSelection
 					? explicitlyRequestedMCPToolNames
 					: defaultSelectedMCPToolNames;
 			initialToolNames = [
@@ -2243,6 +2247,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				? restoredDiscoveredNames
 				: requestedDiscoveredBuiltinToolNames;
 			initialToolNames = [...new Set([...baselineInitialToolNames, ...initialSelectedDiscoveredBuiltinToolNames])];
+			hasExplicitDiscoveredBuiltinToolSelection =
+				hasExplicitToolNames && (options.toolNames!.length === 0 || requestedDiscoveredBuiltinToolNames.length > 0);
 		}
 
 		// Pre-register in the global agent registry BEFORE building the system prompt,
@@ -2543,13 +2549,13 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			mcpDiscoveryEnabled,
 			discoveryMode: effectiveDiscoveryMode,
 			initialSelectedMCPToolNames,
-			initialMCPToolSelectionIsExplicit: hasExplicitToolNames,
-			initialDiscoveredBuiltinToolSelectionIsExplicit: hasExplicitToolNames,
+			initialMCPToolSelectionIsExplicit: hasExplicitMCPToolSelection,
+			initialDiscoveredBuiltinToolSelectionIsExplicit: hasExplicitDiscoveredBuiltinToolSelection,
 			initialSelectedDiscoveredBuiltinToolNames,
 			initialBaselineDiscoveredBuiltinToolNames,
 			defaultSelectedMCPToolNames,
-			persistInitialMCPToolSelection: false,
-			persistInitialDiscoveredBuiltinToolSelection: false,
+			persistInitialMCPToolSelection: !hasExistingSession && hasExplicitMCPToolSelection,
+			persistInitialDiscoveredBuiltinToolSelection: !hasExistingSession && hasExplicitDiscoveredBuiltinToolSelection,
 			initialPersistedMCPToolNames: explicitlyRequestedMCPToolNames,
 			initialPersistedDiscoveredBuiltinToolNames: selectRestorableDiscoveredBuiltinToolNames(
 				explicitRequestedToolNames,

@@ -413,10 +413,33 @@ describe("AgentSession MCP discovery", () => {
 		expect(applyCount).toBe(1);
 
 		const mixedSelectionEntries = sessionManager.getBranch().slice(entriesBeforeMixedActivation);
-		expect(mixedSelectionEntries.filter(entry => entry.type === "mcp_tool_selection")).toHaveLength(1);
-		expect(mixedSelectionEntries.filter(entry => entry.type === "discovered_builtin_tool_selection")).toHaveLength(1);
-		expect(sessionManager.buildSessionContext().selectedMCPToolNames).toEqual(["mcp__docs_search"]);
-		expect(sessionManager.buildSessionContext().selectedDiscoveredBuiltinToolNames).toEqual(["search"]);
+		expect(mixedSelectionEntries.map(entry => entry.type)).toEqual([
+			"mcp_tool_selection",
+			"discovered_builtin_tool_selection",
+		]);
+		const [mcpSelectionEntry, builtinSelectionEntry] = mixedSelectionEntries;
+		expect(mcpSelectionEntry.parentId).toBeNull();
+		expect(builtinSelectionEntry.parentId).toBe(mcpSelectionEntry.id);
+		const mcpMutationCorrelationId =
+			mcpSelectionEntry.type === "mcp_tool_selection" ? mcpSelectionEntry.mutationCorrelationId : undefined;
+		const builtinMutationCorrelationId =
+			builtinSelectionEntry.type === "discovered_builtin_tool_selection"
+				? builtinSelectionEntry.mutationCorrelationId
+				: undefined;
+		expect(mcpMutationCorrelationId).toEqual(expect.any(String));
+		expect(builtinMutationCorrelationId).toBe(mcpMutationCorrelationId);
+		expect(buildSessionContext(mixedSelectionEntries.slice(0, 1))).toMatchObject({
+			hasPersistedMCPToolSelection: true,
+			hasPersistedDiscoveredBuiltinToolSelection: false,
+			selectedMCPToolNames: ["mcp__docs_search"],
+			selectedDiscoveredBuiltinToolNames: undefined,
+		});
+		expect(buildSessionContext(mixedSelectionEntries)).toMatchObject({
+			hasPersistedMCPToolSelection: true,
+			hasPersistedDiscoveredBuiltinToolSelection: true,
+			selectedMCPToolNames: ["mcp__docs_search"],
+			selectedDiscoveredBuiltinToolNames: ["search"],
+		});
 
 		const entriesBeforeBuiltinOnlyActivation = sessionManager.getBranch().length;
 		expect(await session.activateDiscoveredTools(["find"])).toEqual(["find"]);

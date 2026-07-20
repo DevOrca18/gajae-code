@@ -121,6 +121,46 @@ describe("createAgentSession defaultInactive tool activation", () => {
 		}
 	});
 
+	it("persists explicit new-session domain authority, including empty clears", async () => {
+		const namedManager = SessionManager.inMemory();
+		const { session: namedSession } = await createMinimalSession(
+			tempDirs,
+			Settings.isolated({ "tools.discoveryMode": "all" }),
+			["read", "find", "mcp__docs_search"],
+			namedManager,
+			[createMcpCustomTool("mcp__docs_search", "docs", "search")],
+		);
+		try {
+			expect(namedManager.buildSessionContext()).toMatchObject({
+				hasPersistedMCPToolSelection: true,
+				selectedMCPToolNames: ["mcp__docs_search"],
+				hasPersistedDiscoveredBuiltinToolSelection: true,
+				selectedDiscoveredBuiltinToolNames: ["find"],
+			});
+		} finally {
+			await namedSession.dispose();
+		}
+
+		const clearedManager = SessionManager.inMemory();
+		const { session: clearedSession } = await createMinimalSession(
+			tempDirs,
+			Settings.isolated({ "tools.discoveryMode": "all" }),
+			[],
+			clearedManager,
+			[createMcpCustomTool("mcp__docs_search", "docs", "search")],
+		);
+		try {
+			expect(clearedManager.buildSessionContext()).toMatchObject({
+				hasPersistedMCPToolSelection: true,
+				selectedMCPToolNames: [],
+				hasPersistedDiscoveredBuiltinToolSelection: true,
+				selectedDiscoveredBuiltinToolNames: [],
+			});
+		} finally {
+			await clearedSession.dispose();
+		}
+	});
+
 	it("keeps configured MCP defaults when resuming a built-in-only selection", async () => {
 		const sessionManager = SessionManager.inMemory();
 		sessionManager.appendDiscoveredBuiltinToolSelection(["find"]);

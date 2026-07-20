@@ -327,12 +327,16 @@ export interface MCPToolSelectionEntry extends SessionEntryBase {
 	selectedToolNames: string[];
 	/** Legacy v4 combined built-in authority, retained for read compatibility. */
 	selectedDiscoveredBuiltinToolNames?: string[];
+	/** Correlates the ordered MCP and built-in entries emitted by one combined activation. */
+	mutationCorrelationId?: string;
 }
 
 /** Persisted discovered-built-in selection state, independent of MCP authority. */
 export interface DiscoveredBuiltinToolSelectionEntry extends SessionEntryBase {
 	type: "discovered_builtin_tool_selection";
 	selectedToolNames: string[];
+	/** Correlates the ordered MCP and built-in entries emitted by one combined activation. */
+	mutationCorrelationId?: string;
 }
 
 /** Session init entry - captures initial context for subagent sessions (debugging/replay). */
@@ -1512,14 +1516,16 @@ function hasStrictSessionSchema(entries: FileEntry[]): boolean {
 					!value.selectedToolNames.every(name => typeof name === "string") ||
 					(value.selectedDiscoveredBuiltinToolNames !== undefined &&
 						(!Array.isArray(value.selectedDiscoveredBuiltinToolNames) ||
-							!value.selectedDiscoveredBuiltinToolNames.every(name => typeof name === "string")))
+							!value.selectedDiscoveredBuiltinToolNames.every(name => typeof name === "string"))) ||
+					(value.mutationCorrelationId !== undefined && typeof value.mutationCorrelationId !== "string")
 				)
 					return false;
 				break;
 			case "discovered_builtin_tool_selection":
 				if (
 					!Array.isArray(value.selectedToolNames) ||
-					!value.selectedToolNames.every(name => typeof name === "string")
+					!value.selectedToolNames.every(name => typeof name === "string") ||
+					(value.mutationCorrelationId !== undefined && typeof value.mutationCorrelationId !== "string")
 				)
 					return false;
 				break;
@@ -5495,26 +5501,28 @@ export class SessionManager {
 	// =========================================================================
 
 	/** Append MCP discovery selection authority without altering discovered built-in authority. */
-	appendMCPToolSelection(selectedToolNames: string[]): string {
+	appendMCPToolSelection(selectedToolNames: string[], mutationCorrelationId?: string): string {
 		const entry: MCPToolSelectionEntry = {
 			type: "mcp_tool_selection",
 			id: generateId(this.#byId),
 			parentId: this.#leafId,
 			timestamp: new Date().toISOString(),
 			selectedToolNames: [...selectedToolNames],
+			mutationCorrelationId,
 		};
 		this.#appendEntry(entry);
 		return entry.id;
 	}
 
 	/** Append discovered built-in selection authority without altering MCP authority. */
-	appendDiscoveredBuiltinToolSelection(selectedToolNames: string[]): string {
+	appendDiscoveredBuiltinToolSelection(selectedToolNames: string[], mutationCorrelationId?: string): string {
 		const entry: DiscoveredBuiltinToolSelectionEntry = {
 			type: "discovered_builtin_tool_selection",
 			id: generateId(this.#byId),
 			parentId: this.#leafId,
 			timestamp: new Date().toISOString(),
 			selectedToolNames: [...selectedToolNames],
+			mutationCorrelationId,
 		};
 		this.#appendEntry(entry);
 		return entry.id;

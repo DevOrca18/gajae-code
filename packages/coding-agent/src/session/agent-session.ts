@@ -5172,17 +5172,26 @@ export class AgentSession {
 		if (!this.#mcpDiscoveryEnabled && this.#resolveEffectiveDiscoveryMode() !== "all") return;
 		const nextSelectedMCPToolNames = this.getSelectedMCPToolNames();
 		const nextSelectedDiscoveredBuiltinToolNames = this.#getSelectedDiscoveredBuiltinToolNames();
-		if (!this.#selectedMCPToolNamesMatch(previousSelectedMCPToolNames, nextSelectedMCPToolNames)) {
-			this.sessionManager.appendMCPToolSelection(nextSelectedMCPToolNames);
-		}
-		if (
+		const mcpSelectionChanged = !this.#selectedMCPToolNamesMatch(
+			previousSelectedMCPToolNames,
+			nextSelectedMCPToolNames,
+		);
+		const discoveredBuiltinSelectionChanged =
 			this.#resolveEffectiveDiscoveryMode() === "all" &&
 			!this.#selectedMCPToolNamesMatch(
 				previousSelectedDiscoveredBuiltinToolNames,
 				nextSelectedDiscoveredBuiltinToolNames,
-			)
-		) {
-			this.sessionManager.appendDiscoveredBuiltinToolSelection(nextSelectedDiscoveredBuiltinToolNames);
+			);
+		const mutationCorrelationId =
+			mcpSelectionChanged && discoveredBuiltinSelectionChanged ? crypto.randomUUID() : undefined;
+		if (mcpSelectionChanged) {
+			this.sessionManager.appendMCPToolSelection(nextSelectedMCPToolNames, mutationCorrelationId);
+		}
+		if (discoveredBuiltinSelectionChanged) {
+			this.sessionManager.appendDiscoveredBuiltinToolSelection(
+				nextSelectedDiscoveredBuiltinToolNames,
+				mutationCorrelationId,
+			);
 		}
 	}
 

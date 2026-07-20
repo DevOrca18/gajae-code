@@ -70,7 +70,7 @@ Breadcrumb content is two lines: original cwd, then session file path. `continue
 Session files are JSONL: one JSON object per line.
 
 - Line 1 is always the session header (`type: "session"`).
-- Remaining lines are `SessionEntry` values or v4 append-only patch records. `header_patch` records update header metadata and `entry_patch` records replace a message payload when replay metadata is sanitized.
+- Remaining lines are `SessionEntry` values or v4/v5 append-only patch records. `header_patch` records update header metadata and `entry_patch` records replace a message payload when replay metadata is sanitized.
 - Entries and patch records are append-only at runtime; branch navigation moves a pointer (`leafId`) rather than mutating existing entries.
 
 ### Header (`SessionHeader`)
@@ -78,7 +78,7 @@ Session files are JSONL: one JSON object per line.
 ```json
 {
   "type": "session",
-  "version": 4,
+  "version": 5,
   "id": "1f9d2a6b9c0d1234",
   "timestamp": "2026-02-16T10:20:30.000Z",
   "cwd": "/work/pi",
@@ -359,14 +359,27 @@ Applied when header `version < 3`:
 Applied when header `version < 4`:
 
 - Sets header `version = 4`.
-- Enables v4 append-only `header_patch` and `entry_patch` records. Patch records are applied only when the header version is exactly `4`; they are ignored for v1-v3 transcripts.
+- Introduces append-only `header_patch` and `entry_patch` records.
+
+### v4 -> v5
+
+Applied when header `version < 5`:
+
+- Sets header `version = 5`.
+- Separates MCP (`mcp_tool_selection`) and discovered built-in (`discovered_builtin_tool_selection`) selection authority. The legacy v4 combined built-in field remains readable.
+- Patch records replay for v4 and v5 transcripts. Headers with a version greater than 5 are rejected before replay.
 
 ### Migration Trigger and Persistence
 
-- v1-v3 transcripts remain readable without mutation during read-only inspection and strict resume selection.
-- Mutable session loads migrate v1-v3 entries in memory and immediately rewrite the complete JSONL file at version 4.
-- v4 sessions load without a migration rewrite.
+- v1-v4 transcripts remain readable without mutation during read-only inspection and strict resume selection.
+- Mutable session loads migrate v1-v4 entries in memory and immediately rewrite the complete JSONL file at version 5.
+- v5 sessions load without a migration rewrite. Once v5 data exists, do not roll back to a v4 writer: v4 writers cannot preserve v5 selection authority.
 
+### Discovery selection authority
+
+MCP and discovered built-in authority are independent. Constructor `toolNames` establishes authority only for the domain it names; a list containing only built-ins does not suppress configured or exact-config MCP defaults, and a list containing only MCP tools does not suppress built-in baselines. An explicit empty list clears both applicable domains. Explicit new-session names and empty clears are persisted as separate domain entries; omitted selections and configured/exact baselines are not authoritative and are not persisted. Resume reconstructs state without appending authority entries.
+
+A combined activation appends an MCP entry first and a discovered-built-in entry second. Both entries carry the same optional `mutationCorrelationId`; older entries without this field remain valid.
 ## Load and Compatibility Behavior
 
 `loadEntriesFromFile(path)` behavior:
