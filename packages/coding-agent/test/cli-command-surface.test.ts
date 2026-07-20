@@ -114,7 +114,6 @@ describe("GJC public CLI command surface", () => {
 		expect(output).toContain("gjc memory");
 		expect(output).toContain("opt-in filesystem/MAP memory protocol");
 	}, 30_000);
-
 	it("exposes the update command help without launching the TUI", () => {
 		const result = Bun.spawnSync(["bun", cliEntry, "update", "--help"], {
 			cwd: repoRoot,

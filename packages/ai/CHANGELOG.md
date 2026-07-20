@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.11.4] - 2026-07-20
+
 ### Added
 
 - Added the native Kimi Code `k3` catalog entry with its 1M-token context window, multimodal input, and reasoning support.

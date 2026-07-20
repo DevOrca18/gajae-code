@@ -368,6 +368,8 @@ import type {
 	CompactionEntry,
 	DefaultModelSelectionStage,
 	NewSessionOptions,
+	RecoveryHydrationContext,
+	RecoveryHydrationPromotionFence,
 	SessionContext,
 	SessionEntry,
 	SessionManager,
@@ -548,6 +550,8 @@ export interface AgentSessionConfig {
 	initialPersistedMCPToolNames?: string[];
 	/** Explicit discovered built-in authority to write for a new session; distinct from active fallback tools. */
 	initialPersistedDiscoveredBuiltinToolNames?: string[];
+	/** Immutable predecessor authority while a recovery host is read-only. */
+	recoveryHydrationContext?: RecoveryHydrationContext;
 	/** MCP server names whose tools should seed discovery-mode sessions whenever those servers are connected. */
 	defaultSelectedMCPServerNames?: string[];
 	/** MCP tool names that should seed brand-new sessions created from this AgentSession. */
@@ -1638,6 +1642,7 @@ export class AgentSession {
 	/** Constructor authority applies only while this AgentSession instance remains alive. */
 	#constructorMCPToolSelection: string[] | undefined;
 	#constructorDiscoveredBuiltinToolSelection: string[] | undefined;
+	#recoveryHydrationContext: RecoveryHydrationContext | undefined;
 
 	// TTSR manager for time-traveling stream rules
 	#ttsrManager: TtsrManager | undefined = undefined;
@@ -2041,6 +2046,7 @@ export class AgentSession {
 		});
 		// Power assertions are taken per turn (see #beginInFlight); nothing acquired here.
 		this.#evalKernelOwnerId = config.evalKernelOwnerId ?? `agent-session:${Snowflake.next()}`;
+		this.#recoveryHydrationContext = config.recoveryHydrationContext;
 		this.#ownedAsyncJobManager = config.ownedAsyncJobManager;
 		this.#retainedMemorySampler = config.retainedMemorySampler;
 		this.#ownedMcpManager = config.ownedMcpManager;
@@ -2159,12 +2165,17 @@ export class AgentSession {
 			config.persistInitialDiscoveredBuiltinToolSelection === true &&
 			config.initialDiscoveredBuiltinToolSelectionIsExplicit !== false;
 		if (
+			!this.#recoveryHydrationContext &&
 			(this.#mcpDiscoveryEnabled || this.#resolveEffectiveDiscoveryMode() === "all") &&
 			persistInitialMCPToolSelection
 		) {
 			this.sessionManager.appendMCPToolSelection(config.initialPersistedMCPToolNames ?? []);
 		}
-		if (this.#resolveEffectiveDiscoveryMode() === "all" && persistInitialDiscoveredBuiltinToolSelection) {
+		if (
+			!this.#recoveryHydrationContext &&
+			this.#resolveEffectiveDiscoveryMode() === "all" &&
+			persistInitialDiscoveredBuiltinToolSelection
+		) {
 			this.sessionManager.appendDiscoveredBuiltinToolSelection(
 				config.initialPersistedDiscoveredBuiltinToolNames ?? [],
 			);
@@ -6086,8 +6097,29 @@ export class AgentSession {
 		return this.#promptGeneration;
 	}
 
+	/** The immutable recovery authority, present only before external ownership promotion. */
+	get recoveryHydrationContext(): RecoveryHydrationContext | undefined {
+		return this.#recoveryHydrationContext;
+	}
+
+	/** Enables normal session mutations after the owner has published its durable fence and writer lease. */
+	async promoteRecoveryHydrationAfterOwnershipReadyFence(fence: RecoveryHydrationPromotionFence): Promise<void> {
+		const context = this.#recoveryHydrationContext;
+		if (!context) throw new Error("Agent session is not awaiting recovery hydration promotion.");
+		await this.sessionManager.promoteRecoveryHydrationAfterOwnershipReadyFence(context, fence);
+		this.#recoveryHydrationContext = undefined;
+	}
+
+	/** Recovery hydration must not start a continuation before ownership promotion. */
+	#assertRecoveryHydrationPromoted(): void {
+		if (this.#recoveryHydrationContext) {
+			throw new Error("Recovery hydration has not been promoted to a writer-owning session.");
+		}
+	}
+
 	/** Main startup calls this exactly once, after a strict open returned `kind: "opened"`. */
 	async continuePersistedHistory(): Promise<void> {
+		this.#assertRecoveryHydrationPromoted();
 		this.#removeEphemeralCustomMessages();
 
 		if (!canContinuePersistedHistory(this.agent.state.messages)) {
