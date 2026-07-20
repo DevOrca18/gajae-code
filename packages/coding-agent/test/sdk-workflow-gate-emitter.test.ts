@@ -260,11 +260,12 @@ describe("SDK ToolSession forwards getWorkflowGateEmitter", () => {
 		const targetSessionFile = targetSessionManager.getSessionFile();
 		await targetSessionManager.close();
 		if (!targetSessionFile) throw new Error("Expected persisted successor session");
+		const settings = await Settings.loadForScope({ cwd: tempDir, agentDir: tempDir });
 		const { session } = await createAgentSession({
 			cwd: tempDir,
 			agentDir: tempDir,
 			sessionManager,
-			settings: Settings.isolated(),
+			settings,
 			model: getBundledModel("openai", "gpt-4o-mini"),
 			hasUI: false,
 			disableExtensionDiscovery: true,

@@ -6448,28 +6448,25 @@ export class AgentSession {
 	}
 
 	#ensureWorkflowGateAskTool(): void {
-		if (this.#toolRegistry.has("ask")) return;
 		if (!this.#workflowGateToolSession) return;
 
-		const askTool = AskTool.createIf(this.#workflowGateToolSession);
-		if (!askTool) return;
-
-		const wrappedTool = wrapToolWithMetaNotice(askTool as unknown as AgentTool);
-		const finalTool: AgentTool = this.#extensionRunner
-			? new ExtensionToolWrapper(wrappedTool, this.#extensionRunner)
-			: wrappedTool;
-		this.#toolRegistry.set(finalTool.name, finalTool);
-
-		if (!this.getActiveToolNames().includes(finalTool.name)) {
-			const activeTools = [...this.agent.state.tools, finalTool];
-			this.#setGuardedAgentTools(activeTools);
-			this.#invalidateDiscoveryCaches();
-			void this.refreshBaseSystemPrompt().catch(error => {
-				logger.warn("Failed to refresh system prompt after workflow gate ask tool registration", {
-					error: error instanceof Error ? error.message : String(error),
-				});
-			});
+		let askTool = this.#toolRegistry.get("ask");
+		if (!askTool) {
+			const createdAskTool = AskTool.createIf(this.#workflowGateToolSession);
+			if (!createdAskTool) return;
+			const wrappedTool = wrapToolWithMetaNotice(createdAskTool as unknown as AgentTool);
+			askTool = this.#extensionRunner ? new ExtensionToolWrapper(wrappedTool, this.#extensionRunner) : wrappedTool;
+			this.#toolRegistry.set(askTool.name, askTool);
 		}
+
+		if (this.getActiveToolNames().includes(askTool.name)) return;
+		this.#setGuardedAgentTools([...this.agent.state.tools, askTool]);
+		this.#invalidateDiscoveryCaches();
+		void this.refreshBaseSystemPrompt().catch(error => {
+			logger.warn("Failed to refresh system prompt after workflow gate ask tool activation", {
+				error: error instanceof Error ? error.message : String(error),
+			});
+		});
 	}
 
 	get goalRuntime(): GoalRuntime {
@@ -13901,6 +13898,11 @@ export class AgentSession {
 			}
 
 			this.#reconnectToAgent();
+			// Fence predecessor continuations before session_switch starts SDK runtime
+			// teardown. The previous runtime waits for those continuations to settle;
+			// waiting to transfer authority until after hooks creates a circular wait.
+			if (suspendedWorkflowGateEmitter)
+				this.#bindWorkflowGateEmitter(previousSessionState.sessionId, suspendedWorkflowGateEmitter);
 			// session_switch is the post-commit identity signal. SDK authority and
 			// other identity-bound integrations must not observe the successor until
 			// messages, model state, MCP selections, and the agent subscription are live.
@@ -13911,8 +13913,6 @@ export class AgentSession {
 					previousSessionFile,
 				});
 			}
-			if (suspendedWorkflowGateEmitter)
-				this.#bindWorkflowGateEmitter(previousSessionState.sessionId, suspendedWorkflowGateEmitter);
 			return true;
 		} catch (error) {
 			this.sessionManager.restoreState(previousSessionState);

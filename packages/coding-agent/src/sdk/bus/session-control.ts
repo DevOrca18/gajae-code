@@ -143,17 +143,12 @@ export class NotificationSessionController {
 		if (this.#blockedRuntimeSessions.delete(previousSessionId)) this.#blockedRuntimeSessions.add(nextSessionId);
 		if (this.#shuttingDownSessions.delete(previousSessionId)) this.#shuttingDownSessions.add(nextSessionId);
 
-		const previousOperation = this.#sessionOperations.get(previousSessionId);
-		if (!previousOperation) return;
-		const nextOperation = this.#sessionOperations.get(nextSessionId);
-		const completion = nextOperation ? previousOperation.then(() => nextOperation) : previousOperation;
+		// Operations are bound to the identity captured when they were queued. Moving
+		// a predecessor operation to the successor makes successor startup wait for
+		// predecessor teardown, while that teardown can itself await successor
+		// authority: a session-switch deadlock. Leave new-session operations owned by
+		// their new key and let the predecessor operation settle independently.
 		this.#sessionOperations.delete(previousSessionId);
-		this.#sessionOperations.set(nextSessionId, completion);
-		void completion.then(() => {
-			if (this.#sessionOperations.get(nextSessionId) === completion) {
-				this.#sessionOperations.delete(nextSessionId);
-			}
-		});
 	}
 
 	query<Context extends NotificationSessionContext>(context: Context): NotificationSessionStatus {
