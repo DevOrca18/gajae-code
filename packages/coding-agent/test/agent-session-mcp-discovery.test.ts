@@ -394,7 +394,10 @@ describe("AgentSession MCP discovery", () => {
 		const session = new AgentSession({
 			agent,
 			sessionManager,
-			settings: Settings.isolated({ "tools.discoveryMode": "all" }),
+			settings: Settings.isolated({
+				"tools.discoveryMode": "all",
+				"tools.essentialOverride": ["read", "bash", "edit"],
+			}),
 			modelRegistry: {} as never,
 			toolRegistry,
 			mcpDiscoveryEnabled: true,
@@ -631,7 +634,10 @@ describe("AgentSession MCP discovery", () => {
 		const session = new AgentSession({
 			agent,
 			sessionManager,
-			settings: Settings.isolated({ "tools.discoveryMode": "all" }),
+			settings: Settings.isolated({
+				"tools.discoveryMode": "all",
+				"tools.essentialOverride": ["read", "bash", "edit"],
+			}),
 			modelRegistry: {} as never,
 			toolRegistry,
 			mcpDiscoveryEnabled: true,
@@ -686,7 +692,10 @@ describe("AgentSession MCP discovery", () => {
 		const session = new AgentSession({
 			agent,
 			sessionManager,
-			settings: Settings.isolated({ "tools.discoveryMode": "all" }),
+			settings: Settings.isolated({
+				"tools.discoveryMode": "all",
+				"tools.essentialOverride": ["read", "bash", "edit"],
+			}),
 			modelRegistry: {} as never,
 			toolRegistry,
 			mcpDiscoveryEnabled: true,
@@ -860,6 +869,7 @@ describe("AgentSession MCP discovery", () => {
 			sessionManager,
 			settings: Settings.isolated({
 				"tools.discoveryMode": "all",
+				"tools.essentialOverride": ["read", "bash", "edit"],
 				defaultThinkingLevel: "high",
 				serviceTier: "priority",
 			}),
