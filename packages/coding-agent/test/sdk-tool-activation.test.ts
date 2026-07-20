@@ -334,7 +334,7 @@ describe("createAgentSession defaultInactive tool activation", () => {
 		const { session } = await createAgentSession({
 			cwd: tempDir,
 			agentDir: tempDir,
-			sessionManager: SessionManager.inMemory(),
+			sessionManager: SessionManager.inMemory(tempDir),
 			settings: Settings.isolated(),
 			model: getBundledModel("openai", "gpt-4o-mini"),
 			disableExtensionDiscovery: true,
@@ -368,7 +368,7 @@ describe("createAgentSession defaultInactive tool activation", () => {
 		const { session } = await createAgentSession({
 			cwd: tempDir,
 			agentDir: tempDir,
-			sessionManager: SessionManager.inMemory(),
+			sessionManager: SessionManager.inMemory(tempDir),
 			settings: Settings.isolated(),
 			model: getBundledModel("openai", "gpt-4o-mini"),
 			disableExtensionDiscovery: true,
@@ -400,7 +400,7 @@ describe("createAgentSession defaultInactive tool activation", () => {
 		const { session, mcpManager } = await createAgentSession({
 			cwd: tempDir,
 			agentDir: tempDir,
-			sessionManager: SessionManager.inMemory(),
+			sessionManager: SessionManager.inMemory(tempDir),
 			settings: Settings.isolated({
 				"astGrep.enabled": true,
 				"astEdit.enabled": true,
@@ -448,7 +448,7 @@ describe("createAgentSession defaultInactive tool activation", () => {
 		const { session } = await createAgentSession({
 			cwd: tempDir,
 			agentDir: tempDir,
-			sessionManager: SessionManager.inMemory(),
+			sessionManager: SessionManager.inMemory(tempDir),
 			settings: Settings.isolated({ "edit.mode": "vim" }),
 			model: getBundledModel("openai", "gpt-4o-mini"),
 			disableExtensionDiscovery: true,
@@ -500,7 +500,7 @@ describe("createAgentSession defaultInactive tool activation", () => {
 		const { session } = await createAgentSession({
 			cwd: tempDir,
 			agentDir: tempDir,
-			sessionManager: SessionManager.inMemory(),
+			sessionManager: SessionManager.inMemory(tempDir),
 			settings,
 			authStorage,
 			model: baseModel,
