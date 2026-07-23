@@ -124,7 +124,7 @@ function successfulStream(model: Model, content = "Recovered"): AssistantMessage
 	});
 }
 
-describe("AgentSession managed fallback upstream request counts", () => {
+describe("AgentSession fallback upstream request counts", () => {
 	let tempDir: TempDir;
 	let authStorage: AuthStorage;
 	let modelRegistry: ModelRegistry;
@@ -169,6 +169,28 @@ describe("AgentSession managed fallback upstream request counts", () => {
 		session = new AgentSession({ agent, sessionManager: SessionManager.inMemory(), settings, modelRegistry });
 		session!.setConfiguredModelChain("default", [selector(primary), selector(fallback)], "test");
 		return { primary, fallback };
+	}
+
+	function createPlainSession(
+		streamFn: AgentOptions["streamFn"],
+		settingsOverrides: Record<string, unknown> = {},
+	): Model {
+		const primary = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!primary) throw new Error("Expected bundled test model");
+		const agent = new Agent({
+			getApiKey: provider => `${provider}-test-key`,
+			initialState: { model: primary, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn,
+		});
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"retry.baseDelayMs": 10,
+			...settingsOverrides,
+		});
+		settings.setModelRole("default", selector(primary));
+		session = new AgentSession({ agent, sessionManager: SessionManager.inMemory(), settings, modelRegistry });
+		session.setConfiguredModelChain("default", [selector(primary)], "test");
+		return primary;
 	}
 
 	function seedCompactableHistory(primary: Model): void {
@@ -348,6 +370,62 @@ describe("AgentSession managed fallback upstream request counts", () => {
 			stopReason: "error",
 			errorStatus: 400,
 		});
+		expect(
+			session!.messages.filter(message => message.role === "assistant" && message.stopReason === "error"),
+		).toHaveLength(1);
+	});
+
+	it("preserves the terminal overflow assistant after plain no-op maintenance", async () => {
+		const calls: StreamCall[] = [];
+		const events: AgentSessionEvent[] = [];
+		const primary = createPlainSession(
+			(model, _context, options) => {
+				calls.push({
+					selector: selector(model),
+					fallbackManaged: options?.fallbackManaged,
+					fallbackAttempt: options?.fallbackAttempt,
+				});
+				return typedOpaqueOverflowStream(model);
+			},
+			{
+				"compaction.enabled": true,
+				"compaction.keepRecentTokens": 1,
+			},
+		);
+		const prepareSpy = vi.spyOn(compactionModule, "prepareCompaction").mockReturnValue(undefined);
+		session!.subscribe(event => events.push(event));
+
+		await session!.prompt("Preserve the terminal plain overflow");
+		await session!.waitForIdle();
+
+		expect(prepareSpy).toHaveBeenCalled();
+		expect(calls).toEqual([{ selector: selector(primary), fallbackManaged: undefined, fallbackAttempt: undefined }]);
+		expect(events).toContainEqual(
+			expect.objectContaining({
+				type: "auto_compaction_end",
+				action: "context-full",
+				aborted: false,
+				skipped: true,
+				willRetry: false,
+				errorMessage: expect.stringContaining("nothing eligible to compact"),
+			}),
+		);
+		expect(events.filter(event => event.type === "agent_end")).toHaveLength(1);
+		expect(session!.messages.at(-1)).toMatchObject({
+			role: "assistant",
+			stopReason: "error",
+			errorStatus: 400,
+		});
+		expect(
+			session!.sessionManager
+				.getBranch()
+				.filter(
+					entry =>
+						entry.type === "message" &&
+						entry.message.role === "assistant" &&
+						entry.message.stopReason === "error",
+				),
+		).toHaveLength(1);
 	});
 
 	it("preserves successful overflow compaction and retry on the same model", async () => {
@@ -402,6 +480,9 @@ describe("AgentSession managed fallback upstream request counts", () => {
 			role: "assistant",
 			content: [{ type: "text", text: "Recovered after compaction" }],
 		});
+		expect(
+			session!.messages.filter(message => message.role === "assistant" && message.stopReason === "error"),
+		).toHaveLength(0);
 	});
 	it("preserves a prior fallback charge across overflow maintenance", async () => {
 		const calls: string[] = [];

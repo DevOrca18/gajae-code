@@ -609,7 +609,7 @@ type MidRunMaintenanceLifecycle = Parameters<NonNullable<AgentLoopConfig["mainta
 type AutoCompactionTerminalStatus =
 	| { kind: "compacted"; continuationScheduled?: boolean }
 	| { kind: "aborted"; source: "signal" | "hook" }
-	| { kind: "skipped"; continuationScheduled?: boolean }
+	| { kind: "skipped"; continuationScheduled?: boolean; overflowTerminal?: boolean }
 	| { kind: "failed" };
 
 /** Options for AgentSession.prompt() */
@@ -10831,8 +10831,10 @@ export class AgentSession {
 			// Remove the error message from agent state (it IS saved to session for history,
 			// but we don't want it in context for the retry)
 			const messages = this.agent.state.messages;
+			let removedOverflowAssistant = false;
 			if (messages.length > 0 && messages[messages.length - 1].role === "assistant") {
 				this.agent.replaceMessages(messages.slice(0, -1));
+				removedOverflowAssistant = true;
 			}
 
 			// Try context promotion first - switch to a larger model and retry without compacting
@@ -10848,6 +10850,9 @@ export class AgentSession {
 			const compactionSettings = this.settings.getGroup("compaction");
 			if (compactionSettings.enabled && compactionSettings.strategy !== "off") {
 				const status = await this.#runAutoCompaction("overflow", true);
+				if (status.kind === "skipped" && status.overflowTerminal && removedOverflowAssistant) {
+					this.agent.appendMessage(assistantMessage);
+				}
 				return "continuationScheduled" in status && status.continuationScheduled === true;
 			}
 			return this.#scheduleOverflowRetryContinuation(generation);
@@ -12314,7 +12319,7 @@ export class AgentSession {
 					continuationSkipReason,
 				});
 				if (overflowNoopWouldReplay) {
-					return { kind: "skipped" };
+					return { kind: "skipped", overflowTerminal: true };
 				}
 				if (willRetry) {
 					return { kind: "skipped", continuationScheduled: this.#scheduleOverflowRetryContinuation(generation) };
