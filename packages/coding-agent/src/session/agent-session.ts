@@ -12293,16 +12293,29 @@ export class AgentSession {
 			if (autoCompactionSignal.aborted) return await emitAborted();
 
 			if (!preparation) {
-				const continuationSkipReason = willRetry ? this.#detectOverflowRetryContinuationSkip() : undefined;
+				// #checkCompaction removes the failed overflow assistant before entering
+				// this path. A resumable tail would therefore resend the same oversized
+				// request even though maintenance made no change. Non-resumable tails
+				// retain the existing synthetic auto-continue recovery, which changes
+				// the request and is covered by the continuation contract.
+				const overflowNoopWouldReplay = reason === "overflow" && willRetry && this.#isResumableAgentTail();
+				const continuationSkipReason =
+					!overflowNoopWouldReplay && willRetry ? this.#detectOverflowRetryContinuationSkip() : undefined;
 				await this.#emitSessionEvent({
 					type: "auto_compaction_end",
 					action,
 					result: undefined,
 					aborted: false,
-					willRetry: willRetry && !continuationSkipReason,
+					willRetry: overflowNoopWouldReplay ? false : willRetry && !continuationSkipReason,
+					errorMessage: overflowNoopWouldReplay
+						? "Context overflow recovery skipped: nothing eligible to compact. Run /clear to preserve this session ID, or switch to a larger-context model before retrying."
+						: undefined,
 					skipped: true,
 					continuationSkipReason,
 				});
+				if (overflowNoopWouldReplay) {
+					return { kind: "skipped" };
+				}
 				if (willRetry) {
 					return { kind: "skipped", continuationScheduled: this.#scheduleOverflowRetryContinuation(generation) };
 				}
