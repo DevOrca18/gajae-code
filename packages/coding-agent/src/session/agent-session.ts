@@ -10795,7 +10795,11 @@ export class AgentSession {
 	 * @param assistantMessage The assistant message to check
 	 * @param skipAbortedCheck If false, include aborted messages (for pre-prompt check). Default: true
 	 */
-	async #checkCompaction(assistantMessage: AssistantMessage, skipAbortedCheck = true): Promise<boolean> {
+	async #checkCompaction(
+		assistantMessage: AssistantMessage,
+		skipAbortedCheck = true,
+		onTerminalOverflowNoop?: () => void,
+	): Promise<boolean> {
 		// Safety stops are terminal and must not trigger context maintenance.
 		if (
 			assistantMessage.errorKind === "provider_safety_stop" ||
@@ -10831,8 +10835,10 @@ export class AgentSession {
 			// Remove the error message from agent state (it IS saved to session for history,
 			// but we don't want it in context for the retry)
 			const messages = this.agent.state.messages;
+			let removedOverflowAssistant = false;
 			if (messages.length > 0 && messages[messages.length - 1].role === "assistant") {
 				this.agent.replaceMessages(messages.slice(0, -1));
+				removedOverflowAssistant = true;
 			}
 
 			// Try context promotion first - switch to a larger model and retry without compacting
@@ -10847,7 +10853,15 @@ export class AgentSession {
 			// No promotion target available fall through to compaction
 			const compactionSettings = this.settings.getGroup("compaction");
 			if (compactionSettings.enabled && compactionSettings.strategy !== "off") {
-				const status = await this.#runAutoCompaction("overflow", true);
+				const status = await this.#runAutoCompaction("overflow", true, false, {
+					beforeTerminalOverflowNoop: () => {
+						if (onTerminalOverflowNoop) {
+							onTerminalOverflowNoop();
+						} else if (removedOverflowAssistant) {
+							this.agent.appendMessage(assistantMessage);
+						}
+					},
+				});
 				return "continuationScheduled" in status && status.continuationScheduled === true;
 			}
 			return this.#scheduleOverflowRetryContinuation(generation);
@@ -12156,6 +12170,7 @@ export class AgentSession {
 			deferHandoffMaintenance?: boolean;
 			force?: boolean;
 			signal?: AbortSignal;
+			beforeTerminalOverflowNoop?: () => void;
 		},
 	): Promise<AutoCompactionTerminalStatus> {
 		const compactionSettings = this.settings.getGroup("compaction");
@@ -12293,16 +12308,42 @@ export class AgentSession {
 			if (autoCompactionSignal.aborted) return await emitAborted();
 
 			if (!preparation) {
-				const continuationSkipReason = willRetry ? this.#detectOverflowRetryContinuationSkip() : undefined;
+				// #checkCompaction removes the failed overflow assistant before entering
+				// this path. A resumable tail would therefore resend the same oversized
+				// request even though maintenance made no change. Non-resumable tails
+				// retain the existing synthetic auto-continue recovery, which changes
+				// the request and is covered by the continuation contract.
+				const overflowNoopWouldReplay = reason === "overflow" && willRetry && this.#isResumableAgentTail();
+				const continuationSkipReason =
+					!overflowNoopWouldReplay && willRetry ? this.#detectOverflowRetryContinuationSkip() : undefined;
+				if (overflowNoopWouldReplay) {
+					options?.beforeTerminalOverflowNoop?.();
+				}
 				await this.#emitSessionEvent({
 					type: "auto_compaction_end",
 					action,
 					result: undefined,
 					aborted: false,
-					willRetry: willRetry && !continuationSkipReason,
+					willRetry: overflowNoopWouldReplay ? false : willRetry && !continuationSkipReason,
+					errorMessage: overflowNoopWouldReplay
+						? "Context overflow recovery skipped: nothing eligible to compact. Run /clear to preserve this session ID, or switch to a larger-context model before retrying."
+						: undefined,
 					skipped: true,
 					continuationSkipReason,
 				});
+				if (overflowNoopWouldReplay) {
+					if (continueAfterMaintenance && this.agent.hasQueuedMessages()) {
+						this.#scheduleAgentContinue({
+							delayMs: 100,
+							generation,
+							shouldContinue: () => this.agent.hasQueuedMessages(),
+							onSkip: skipReason => this.#logCompactionContinuationSkipped("queued_continue", skipReason),
+							onError: error => this.#logCompactionContinuationError("queued_continue", error),
+						});
+						return { kind: "skipped", continuationScheduled: true };
+					}
+					return { kind: "skipped" };
+				}
 				if (willRetry) {
 					return { kind: "skipped", continuationScheduled: this.#scheduleOverflowRetryContinuation(generation) };
 				}
@@ -12940,8 +12981,15 @@ export class AgentSession {
 				type: "maintenance",
 				continuation: async ownership => {
 					if (!ownership.isCurrent()) return;
-					const successorScheduled = await this.#checkCompaction(outcome.message);
-					if (successorScheduled || !ownership.isCurrent()) return;
+					let terminalized = false;
+					const successorScheduled = await this.#checkCompaction(outcome.message, true, () => {
+						terminalized = true;
+						this.agent.requestRunTerminal(ownership.logicalRunId, {
+							stopReason: "error",
+							messages: [outcome.message],
+						});
+					});
+					if (terminalized || successorScheduled || !ownership.isCurrent()) return;
 					this.agent.requestRunTerminal(ownership.logicalRunId, {
 						stopReason: "error",
 						messages: [outcome.message],
