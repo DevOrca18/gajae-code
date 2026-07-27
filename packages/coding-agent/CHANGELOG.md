@@ -3,6 +3,7 @@
 ## [Unreleased]
 ### Fixed
 
+- Overflow maintenance now stops cleanly when no-op compaction would replay the same oversized request; the runtime status explains that `/clear` preserves the current session ID before retrying.
 - The `ask` tool no longer rejects a JSON-string-encoded single-sided Round 0 payload before coercion; only the retired contract+review pair stays terminal, so a provider that serializes `questions` as a string no longer drives the model into an unbounded retry loop.
 - macOS screenshot paths now recover the narrow no-break space before `AM`/`PM` for any following separator, so IDE-attached files such as `Screenshot … 11.23.30 PM-1785075812409.png` resolve instead of failing with `ENOENT`; word continuations like ` PMX` are left untouched.
 - ACP failures now reach the client with a real JSON-RPC code instead of collapsing to an opaque `-32603 Internal error`: internal string codes with an ACP counterpart map onto auth-required, resource-not-found, and invalid-params, the rest keep their discriminator in `data`, and translation happens once at the connection boundary. An unrecognized `extMethod` now returns `-32601` rather than a resolved `{ok:false}` payload.
