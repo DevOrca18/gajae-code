@@ -359,6 +359,14 @@ function discoverEnvironment(env: Record<string, string | undefined>, result: Cr
 		}
 	}
 }
+function discoverCodexEnvironment(env: Record<string, string | undefined>, result: CredentialDiscoveryResult): void {
+	for (const variable of OPENAI_ENV_KEYS) {
+		const value = nonEmptyString(env[variable]);
+		if (value) {
+			result.environment.push({ provider: "openai-codex", variable, redactedValue: redactSecret(value) });
+		}
+	}
+}
 
 // ─── Public API ──────────────────────────────────────────────────────────────
 
@@ -380,6 +388,19 @@ export async function discoverExternalCredentials(options: DiscoveryOptions = {}
 	await discoverClaudeCode({ homeDir, platform, readClaudeKeychain: options.readClaudeKeychain }, result);
 	await discoverCodex(homeDir, result);
 	discoverEnvironment(env, result);
+	return result;
+}
+/**
+ * Discover only Codex CLI credentials and OpenAI environment hints.
+ *
+ * This boundary intentionally never reads Claude files or the macOS Keychain.
+ */
+export async function discoverCodexCredentials(options: DiscoveryOptions = {}): Promise<CredentialDiscoveryResult> {
+	const homeDir = options.homeDir ?? os.homedir();
+	const env = options.env ?? process.env;
+	const result: CredentialDiscoveryResult = { importable: [], skipped: [], environment: [] };
+	await discoverCodex(homeDir, result);
+	discoverCodexEnvironment(env, result);
 	return result;
 }
 

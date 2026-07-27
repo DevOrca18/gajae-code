@@ -15,6 +15,7 @@ import {
 	type CredentialDiscoveryResult,
 	type CredentialOrigin,
 	type DiscoveryOptions,
+	discoverCodexCredentials,
 	discoverExternalCredentials,
 	EXTERNAL_PROVIDER_LABELS,
 	type ExternalProvider,
@@ -430,9 +431,10 @@ export function formatCredentialAutoImportResult(result: CredentialAutoImportRes
 
 export interface StartupCredentialAutoImportOptions {
 	authStorage: CredentialAutoImportOptions["authStorage"] &
-		Partial<Pick<AuthStorage, "onCredentialDisabled" | "onGenerationChanged">>;
+		Partial<Pick<AuthStorage, "isRemoteCredentialStore" | "onCredentialDisabled" | "onGenerationChanged">>;
 	modelRegistry: Pick<ModelRegistry, "refresh"> & Partial<Pick<ModelRegistry, "setCredentialRecovery">>;
 	discover?: CredentialAutoImportOptions["discover"];
+	recoveryDiscover?: CredentialAutoImportOptions["discover"];
 	version?: string;
 	agentDir?: string;
 	stateStore?: CredentialAutoImportStateStore;
@@ -440,8 +442,10 @@ export interface StartupCredentialAutoImportOptions {
 
 export interface AcceptedExternalCredentialRecoveryOptions {
 	authStorage: CredentialAutoImportOptions["authStorage"] &
-		Pick<AuthStorage, "onCredentialDisabled" | "onGenerationChanged">;
+		Pick<AuthStorage, "onCredentialDisabled" | "onGenerationChanged"> &
+		Partial<Pick<AuthStorage, "isRemoteCredentialStore">>;
 	modelRegistry: Pick<ModelRegistry, "refresh">;
+	/** Codex-only discovery function. Defaults to {@link discoverCodexCredentials}. */
 	discover?: CredentialAutoImportOptions["discover"];
 	agentDir?: string;
 	stateStore?: CredentialAutoImportStateStore;
@@ -452,7 +456,9 @@ function supportsAcceptedExternalCredentialRecovery(
 ): authStorage is CredentialAutoImportOptions["authStorage"] &
 	Pick<AuthStorage, "onCredentialDisabled" | "onGenerationChanged"> {
 	return (
-		typeof authStorage.onCredentialDisabled === "function" && typeof authStorage.onGenerationChanged === "function"
+		authStorage.isRemoteCredentialStore?.() !== true &&
+		typeof authStorage.onCredentialDisabled === "function" &&
+		typeof authStorage.onGenerationChanged === "function"
 	);
 }
 
@@ -509,50 +515,125 @@ function fingerprintOAuthCandidates(candidates: readonly ImportableCredential[])
 function isRecoverableCodexDisable(event: CredentialDisabledEvent): boolean {
 	return event.provider === "openai-codex" && event.disabledCause.startsWith("oauth refresh failed:");
 }
+const MAX_TRANSIENT_RECOVERY_READ_FAILURES = 3;
+
+interface PendingCredentialRecovery {
+	epoch: number;
+	transientReadFailures: number;
+}
+
+function scopeCodexDiscovery(discovered: CredentialDiscoveryResult): CredentialDiscoveryResult {
+	return {
+		importable: discovered.importable.filter(credential => credential.provider === "openai-codex"),
+		skipped: discovered.skipped.filter(credential => credential.origin === "codex-file"),
+		environment: discovered.environment.filter(credential => credential.provider === "openai-codex"),
+	};
+}
 
 export function createAcceptedExternalCredentialRecovery({
 	authStorage,
 	modelRegistry,
-	discover = discoverExternalCredentials,
+	discover = discoverCodexCredentials,
 	agentDir,
 	stateStore,
 }: AcceptedExternalCredentialRecoveryOptions): (provider: string) => Promise<boolean> {
+	if (authStorage.isRemoteCredentialStore?.() === true) {
+		throw new Error("Codex OAuth recovery is supported only for local credential storage");
+	}
 	const store = stateStore ?? createCredentialAutoImportStateStore(agentDir);
-	const pendingProviders = new Set<string>();
+	const pendingProviders = new Map<string, PendingCredentialRecovery>();
 	const attemptedFingerprints = new Map<string, string>();
+	let epoch = 0;
+
 	authStorage.onGenerationChanged(() => {
+		epoch += 1;
 		pendingProviders.clear();
 	});
 	authStorage.onCredentialDisabled(event => {
-		if (isRecoverableCodexDisable(event)) pendingProviders.add(event.provider);
+		if (isRecoverableCodexDisable(event)) {
+			pendingProviders.set(event.provider, { epoch, transientReadFailures: 0 });
+		}
 	});
 
 	return async provider => {
-		if (provider !== "openai-codex" || !pendingProviders.delete(provider)) return false;
-		const stateRead = await readStateSafely(store);
-		if (stateRead.unreadable || stateRead.state.initialImportResolution !== "accepted") return false;
+		if (provider !== "openai-codex") return false;
+		const trigger = pendingProviders.get(provider);
+		if (!trigger || trigger.epoch !== epoch) return false;
 
-		const result = await runExternalCredentialAutoImport({
-			authStorage,
-			discover: async options => {
-				const discovered = await discover(options);
-				const scoped: CredentialDiscoveryResult = {
-					importable: discovered.importable.filter(credential => credential.provider === provider),
-					skipped: discovered.skipped.filter(credential => credential.origin === "codex-file"),
-					environment: discovered.environment.filter(credential => credential.provider === provider),
-				};
-				const candidates = filterAutoImportOAuthCredentials(scoped.importable);
-				const fingerprint = fingerprintOAuthCandidates(candidates);
-				if (!fingerprint || attemptedFingerprints.get(provider) === fingerprint) {
-					return { ...scoped, importable: [] };
-				}
-				attemptedFingerprints.set(provider, fingerprint);
-				return scoped;
-			},
-			trigger: "oauth-recovery",
-		});
-		if (result.failures.length > 0) logCredentialAutoImportFailures("oauth-recovery", result.failures);
-		if (!result.imported.some(credential => credential.provider === provider)) return false;
+		const isTriggerCurrent = (): boolean => trigger.epoch === epoch && pendingProviders.get(provider) === trigger;
+		const consumeTrigger = (): void => {
+			if (isTriggerCurrent()) pendingProviders.delete(provider);
+		};
+		const preserveTransientFailure = (): void => {
+			if (!isTriggerCurrent()) return;
+			trigger.transientReadFailures += 1;
+			if (trigger.transientReadFailures >= MAX_TRANSIENT_RECOVERY_READ_FAILURES) {
+				pendingProviders.delete(provider);
+			}
+		};
+
+		const stateRead = await readStateSafely(store);
+		if (!isTriggerCurrent()) return false;
+		if (stateRead.unreadable || stateRead.problems.length > 0) {
+			preserveTransientFailure();
+			return false;
+		}
+		if (stateRead.state.initialImportResolution !== "accepted") {
+			consumeTrigger();
+			return false;
+		}
+
+		let discovered: CredentialDiscoveryResult;
+		try {
+			discovered = scopeCodexDiscovery(await discover());
+		} catch {
+			preserveTransientFailure();
+			return false;
+		}
+		if (!isTriggerCurrent()) return false;
+
+		const discoveryFailures: CredentialAutoImportFailure[] = discovered.skipped.map(skip => ({
+			origin: skip.origin,
+			source: skip.source,
+			failureClass: classifyDiscoverySkip(skip.reason, skip.origin),
+		}));
+		const candidates = filterAutoImportOAuthCredentials(discovered.importable);
+		if (candidates.length === 0) {
+			if (discoveryFailures.length > 0) {
+				logCredentialAutoImportFailures("oauth-recovery", discoveryFailures);
+				preserveTransientFailure();
+			} else {
+				consumeTrigger();
+			}
+			return false;
+		}
+
+		const fingerprint = fingerprintOAuthCandidates(candidates);
+		if (!fingerprint || attemptedFingerprints.get(provider) === fingerprint) {
+			consumeTrigger();
+			return false;
+		}
+		if (!isTriggerCurrent()) return false;
+		attemptedFingerprints.set(provider, fingerprint);
+		consumeTrigger();
+
+		let imported = false;
+		const importFailures: CredentialAutoImportFailure[] = [];
+		for (const candidate of candidates) {
+			if (epoch !== trigger.epoch) break;
+			try {
+				const outcome = await authStorage.importCredentialIfAbsent(
+					candidate.provider,
+					candidate.credential as AuthCredential,
+				);
+				if (outcome.inserted) imported = true;
+			} catch (error) {
+				importFailures.push({ credential: candidate, failureClass: classifyWriteFailure(error) });
+			}
+		}
+		if (importFailures.length > 0) logCredentialAutoImportFailures("oauth-recovery", importFailures);
+		if (!imported) return false;
+
 		try {
 			await modelRegistry.refresh("offline");
 		} catch {
@@ -566,6 +647,7 @@ export async function runStartupCredentialAutoImportIfNeeded({
 	authStorage: activeAuthStorage,
 	modelRegistry: activeModelRegistry,
 	discover,
+	recoveryDiscover,
 	version = VERSION,
 	agentDir,
 	stateStore,
@@ -576,7 +658,7 @@ export async function runStartupCredentialAutoImportIfNeeded({
 			createAcceptedExternalCredentialRecovery({
 				authStorage: activeAuthStorage,
 				modelRegistry: activeModelRegistry,
-				discover,
+				discover: recoveryDiscover,
 				agentDir,
 				stateStore: store,
 			}),

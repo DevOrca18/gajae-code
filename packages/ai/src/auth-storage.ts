@@ -426,6 +426,15 @@ export interface CredentialDisabledEvent {
 	provider: string;
 	disabledCause: string;
 }
+export class SelectedCredentialUnavailableError extends Error {
+	readonly provider: string;
+
+	constructor(provider: string, selector: string) {
+		super(`Selected credential for ${provider} (${selector}) is unavailable`);
+		this.name = "SelectedCredentialUnavailableError";
+		this.provider = provider;
+	}
+}
 
 /**
  * How {@link AuthStorage} orders multiple healthy OAuth credentials of the same
@@ -903,6 +912,15 @@ export class AuthStorage {
 
 	getGeneration(): number {
 		return this.#generation;
+	}
+	/**
+	 * Whether credential mutations are broker-backed rather than local.
+	 *
+	 * Local-only recovery features use this capability boundary instead of
+	 * attempting writes through a remote broker without broker failure context.
+	 */
+	isRemoteCredentialStore(): boolean {
+		return this.#store.upsertAuthCredentialRemoteIfAbsent !== undefined;
 	}
 
 	onGenerationChanged(listener: (generation: number) => void): () => void {
@@ -2045,7 +2063,9 @@ export class AuthStorage {
 	 * Logout from a provider.
 	 */
 	async logout(provider: string): Promise<void> {
+		const generation = this.#generation;
 		await this.remove(provider);
+		if (this.#generation === generation) this.#bumpGeneration("logout");
 	}
 
 	// ─────────────────────────────────────────────────────────────────────────────
@@ -3407,8 +3427,9 @@ export class AuthStorage {
 		}
 		if (this.#getCredentialSelector(provider, options)) {
 			const selector = this.#getCredentialSelector(provider, options);
-			throw new Error(
-				`Selected credential for ${provider} (${selector ? this.#formatCredentialSelector(selector) : "unknown"}) is unavailable`,
+			throw new SelectedCredentialUnavailableError(
+				provider,
+				selector ? this.#formatCredentialSelector(selector) : "unknown",
 			);
 		}
 

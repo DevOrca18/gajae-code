@@ -399,6 +399,8 @@ describe("accepted external credential recovery", () => {
 	function createHarness(options: {
 		initialImportResolution?: "accepted" | "declined";
 		candidate?: ImportableCredential;
+		stateStore?: CredentialAutoImportStateStore;
+		discover?: () => Promise<CredentialDiscoveryResult>;
 	}) {
 		let disabledListener: ((event: { provider: string; disabledCause: string }) => void | Promise<void>) | undefined;
 		let generationListener: ((generation: number) => void) | undefined;
@@ -437,11 +439,13 @@ describe("accepted external credential recovery", () => {
 				},
 			},
 			modelRegistry: { refresh: async () => {} },
-			stateStore: stateStore(options.initialImportResolution ?? "accepted"),
-			discover: async () => {
-				discoveryReads += 1;
-				return discovery([candidate]);
-			},
+			stateStore: options.stateStore ?? stateStore(options.initialImportResolution ?? "accepted"),
+			discover:
+				options.discover ??
+				(async () => {
+					discoveryReads += 1;
+					return discovery([candidate]);
+				}),
 		});
 		return {
 			recover,
@@ -527,6 +531,120 @@ describe("accepted external credential recovery", () => {
 		expect(harness.importedRefreshTokens).toEqual(["codex-refresh-1", "codex-refresh-2"]);
 	});
 
+	test("preserves an armed trigger across unreadable and malformed consent state", async () => {
+		let stateReads = 0;
+		const retryingStateStore: CredentialAutoImportStateStore = {
+			read: async () => {
+				stateReads += 1;
+				if (stateReads === 1) return { state: {}, problems: [], unreadable: true };
+				if (stateReads === 2) return { state: {}, problems: ["malformed-json"], unreadable: false };
+				return {
+					state: { initialImportResolution: "accepted", lastImportVersion: VERSION },
+					problems: [],
+					unreadable: false,
+				};
+			},
+			write: async () => true,
+		};
+		const harness = createHarness({ stateStore: retryingStateStore });
+		await harness.emitDisabled();
+
+		expect(await harness.recover("openai-codex")).toBe(false);
+		expect(await harness.recover("openai-codex")).toBe(false);
+		expect(await harness.recover("openai-codex")).toBe(true);
+		expect(stateReads).toBe(3);
+		expect(harness.importedRefreshTokens).toEqual(["codex-refresh-1"]);
+	});
+
+	test("preserves malformed Codex discovery for a bounded retry", async () => {
+		let discoveryReads = 0;
+		const candidate = oauthCredential({
+			provider: "openai-codex",
+			origin: "codex-file",
+			source: "Codex CLI (test)",
+			credential: {
+				type: "oauth",
+				access: "codex-access-retry",
+				refresh: "codex-refresh-retry",
+				expires: Date.now() + 60_000,
+			},
+		});
+		const harness = createHarness({
+			discover: async () => {
+				discoveryReads += 1;
+				return discoveryReads === 1
+					? discovery(
+							[],
+							[
+								{
+									origin: "codex-file",
+									source: "Codex CLI (~/.codex/auth.json)",
+									reason: "malformed credential file (SyntaxError)",
+								},
+							],
+						)
+					: discovery([candidate]);
+			},
+		});
+		await harness.emitDisabled();
+
+		expect(await harness.recover("openai-codex")).toBe(false);
+		expect(await harness.recover("openai-codex")).toBe(true);
+		expect(discoveryReads).toBe(2);
+		expect(harness.importedRefreshTokens).toEqual(["codex-refresh-retry"]);
+	});
+
+	test("bounds repeated transient discovery failures for one disable event", async () => {
+		let discoveryReads = 0;
+		const harness = createHarness({
+			discover: async () => {
+				discoveryReads += 1;
+				return discovery(
+					[],
+					[
+						{
+							origin: "codex-file",
+							source: "Codex CLI (~/.codex/auth.json)",
+							reason: "unreadable credential file (EACCES)",
+						},
+					],
+				);
+			},
+		});
+		await harness.emitDisabled();
+
+		for (let attempt = 0; attempt < 4; attempt += 1) {
+			expect(await harness.recover("openai-codex")).toBe(false);
+		}
+		expect(discoveryReads).toBe(3);
+	});
+
+	test("cancels an in-flight recovery when generation changes during discovery", async () => {
+		const discoveryStarted = Promise.withResolvers<void>();
+		const releaseDiscovery = Promise.withResolvers<void>();
+		const candidate = oauthCredential({
+			provider: "openai-codex",
+			origin: "codex-file",
+			source: "Codex CLI (test)",
+		});
+		const harness = createHarness({
+			discover: async () => {
+				discoveryStarted.resolve();
+				await releaseDiscovery.promise;
+				return discovery([candidate]);
+			},
+		});
+		await harness.emitDisabled();
+
+		const recovery = harness.recover("openai-codex");
+		await discoveryStarted.promise;
+		harness.emitGenerationChanged();
+		releaseDiscovery.resolve();
+
+		expect(await recovery).toBe(false);
+		expect(harness.importedRefreshTokens).toEqual([]);
+	});
+
 	test("startup installs recovery before a resolved accepted marker skips discovery", async () => {
 		let disabledListener: ((event: { provider: string; disabledCause: string }) => void | Promise<void>) | undefined;
 		let recovery: ((provider: string) => Promise<boolean>) | undefined;
@@ -551,7 +669,7 @@ describe("accepted external credential recovery", () => {
 				},
 			},
 			stateStore: stateStore("accepted"),
-			discover: async () => {
+			recoveryDiscover: async () => {
 				discoveryReads += 1;
 				return discovery([
 					oauthCredential({
@@ -571,6 +689,39 @@ describe("accepted external credential recovery", () => {
 		expect(await recovery?.("openai-codex")).toBe(true);
 		expect(discoveryReads).toBe(1);
 		expect(importedProviders).toEqual(["openai-codex"]);
+	});
+
+	test("does not install local Codex recovery for a remote credential store", async () => {
+		let recoveryInstallCalls = 0;
+		await runStartupCredentialAutoImportIfNeeded({
+			authStorage: {
+				isRemoteCredentialStore: () => true,
+				onCredentialDisabled: () => () => {},
+				onGenerationChanged: () => () => {},
+				importCredentialIfAbsent: async provider => inserted(provider),
+			},
+			modelRegistry: {
+				refresh: async () => {},
+				setCredentialRecovery: () => {
+					recoveryInstallCalls += 1;
+				},
+			},
+			stateStore: stateStore("accepted"),
+		});
+
+		expect(recoveryInstallCalls).toBe(0);
+		expect(() =>
+			createAcceptedExternalCredentialRecovery({
+				authStorage: {
+					isRemoteCredentialStore: () => true,
+					onCredentialDisabled: () => () => {},
+					onGenerationChanged: () => () => {},
+					importCredentialIfAbsent: async provider => inserted(provider),
+				},
+				modelRegistry: { refresh: async () => {} },
+				stateStore: stateStore("accepted"),
+			}),
+		).toThrow("supported only for local credential storage");
 	});
 
 	test("retries the failed live lookup with the newly imported Codex credential", async () => {
@@ -620,6 +771,123 @@ describe("accepted external credential recovery", () => {
 
 			await authStorage.remove("openai-codex");
 			expect(await registry.getApiKeyForProvider("openai-codex")).toBeUndefined();
+			expect(discoveryReads).toBe(1);
+		} finally {
+			authStorage?.close();
+			await fs.rm(agentDir, { recursive: true, force: true });
+		}
+	});
+
+	test("logout cancels real local recovery while Codex discovery is in flight", async () => {
+		const agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-codex-oauth-logout-race-"));
+		const discoveryStarted = Promise.withResolvers<void>();
+		const releaseDiscovery = Promise.withResolvers<void>();
+		let authStorage: AuthStorage | undefined;
+		try {
+			authStorage = await AuthStorage.create(path.join(agentDir, "agent.db"), {
+				refreshOAuthCredential: async () => {
+					throw new Error("401 invalid_grant");
+				},
+			});
+			await authStorage.importCredentialIfAbsent("openai-codex", {
+				type: "oauth",
+				access: "stale-race-access",
+				refresh: "stale-race-refresh",
+				expires: Date.now() - 1,
+			});
+			const registry = new ModelRegistry(authStorage, path.join(agentDir, "models.yml"));
+			registry.setCredentialRecovery(
+				createAcceptedExternalCredentialRecovery({
+					authStorage,
+					modelRegistry: registry,
+					stateStore: stateStore("accepted"),
+					discover: async () => {
+						discoveryStarted.resolve();
+						await releaseDiscovery.promise;
+						return discovery([
+							oauthCredential({
+								provider: "openai-codex",
+								origin: "codex-file",
+								source: "Codex CLI (test)",
+								credential: {
+									type: "oauth",
+									access: "fresh-race-access",
+									refresh: "fresh-race-refresh",
+									expires: Date.now() + 10 * 60_000,
+								},
+								expiresAt: Date.now() + 10 * 60_000,
+							}),
+						]);
+					},
+				}),
+			);
+
+			const lookup = registry.getApiKeyForProvider("openai-codex");
+			await discoveryStarted.promise;
+			await authStorage.logout("openai-codex");
+			releaseDiscovery.resolve();
+
+			expect(await lookup).toBeUndefined();
+			expect(authStorage.has("openai-codex")).toBe(false);
+		} finally {
+			releaseDiscovery.resolve();
+			authStorage?.close();
+			await fs.rm(agentDir, { recursive: true, force: true });
+		}
+	});
+
+	test("retries a pinned lookup only after its selected credential is definitively disabled", async () => {
+		const agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-pinned-codex-oauth-recovery-"));
+		let authStorage: AuthStorage | undefined;
+		try {
+			authStorage = await AuthStorage.create(path.join(agentDir, "agent.db"), {
+				refreshOAuthCredential: async () => {
+					throw new Error("401 invalid_grant");
+				},
+			});
+			await authStorage.importCredentialIfAbsent("openai-codex", {
+				type: "oauth",
+				access: "stale-pinned-access",
+				refresh: "stale-pinned-refresh",
+				expires: Date.now() - 1,
+				accountId: "account-pinned",
+				email: "pinned@example.com",
+			});
+			authStorage.setRuntimeCredentialSelector("openai-codex", {
+				kind: "email",
+				value: "pinned@example.com",
+			});
+			const registry = new ModelRegistry(authStorage, path.join(agentDir, "models.yml"));
+			let discoveryReads = 0;
+			registry.setCredentialRecovery(
+				createAcceptedExternalCredentialRecovery({
+					authStorage,
+					modelRegistry: registry,
+					stateStore: stateStore("accepted"),
+					discover: async () => {
+						discoveryReads += 1;
+						return discovery([
+							oauthCredential({
+								provider: "openai-codex",
+								origin: "codex-file",
+								source: "Codex CLI (test)",
+								identity: { accountId: "account-pinned", email: "pinned@example.com" },
+								credential: {
+									type: "oauth",
+									access: "fresh-pinned-access",
+									refresh: "fresh-pinned-refresh",
+									expires: Date.now() + 10 * 60_000,
+									accountId: "account-pinned",
+									email: "pinned@example.com",
+								},
+								expiresAt: Date.now() + 10 * 60_000,
+							}),
+						]);
+					},
+				}),
+			);
+
+			expect(await registry.getApiKeyForProvider("openai-codex")).toBe("fresh-pinned-access");
 			expect(discoveryReads).toBe(1);
 		} finally {
 			authStorage?.close();

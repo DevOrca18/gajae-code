@@ -402,4 +402,23 @@ try {
 			}
 		});
 	});
+
+	test("local storage reports its recovery boundary and logout bumps generation", async () => {
+		const storage = await AuthStorage.create(path.join(tempDir, "generation.db"));
+		try {
+			expect(storage.isRemoteCredentialStore()).toBe(false);
+			await storage.importCredentialIfAbsent("anthropic", oauth("logout"));
+			const generations: number[] = [];
+			storage.onGenerationChanged(generation => generations.push(generation));
+
+			await storage.logout("anthropic");
+			const firstLogoutGeneration = storage.getGeneration();
+			await storage.logout("anthropic");
+
+			expect(generations).toEqual([firstLogoutGeneration, storage.getGeneration()]);
+			expect(storage.has("anthropic")).toBe(false);
+		} finally {
+			storage.close();
+		}
+	});
 });

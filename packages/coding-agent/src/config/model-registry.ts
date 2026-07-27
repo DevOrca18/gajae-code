@@ -21,6 +21,7 @@ import {
 	PROVIDER_DESCRIPTORS,
 	readModelCache,
 	registerCustomApi,
+	SelectedCredentialUnavailableError,
 	type SimpleStreamOptions,
 	type ThinkingConfig,
 	UNK_CONTEXT_WINDOW,
@@ -2565,7 +2566,8 @@ export class ModelRegistry {
 	/**
 	 * Configure an optional last-resort credential recovery callback.
 	 *
-	 * The callback runs only after normal credential lookup returns no key.
+	 * The callback runs only after normal credential lookup returns no key or a
+	 * pinned lookup reports that its selected credential became unavailable.
 	 * Calls for the same provider share one recovery attempt, then retry the
 	 * original lookup exactly once when recovery reports success.
 	 */
@@ -2598,7 +2600,20 @@ export class ModelRegistry {
 		if (this.#keylessProviders.has(provider) && !this.authStorage.hasAuth(provider)) {
 			return kNoAuth;
 		}
-		const apiKey = await lookup();
+		let apiKey: string | undefined;
+		try {
+			apiKey = await lookup();
+		} catch (error) {
+			if (
+				!(error instanceof SelectedCredentialUnavailableError) ||
+				error.provider !== provider ||
+				!allowRecovery ||
+				!(await this.#recoverCredential(provider))
+			) {
+				throw error;
+			}
+			return lookup();
+		}
 		if (apiKey !== undefined || !allowRecovery || !(await this.#recoverCredential(provider))) {
 			return apiKey;
 		}

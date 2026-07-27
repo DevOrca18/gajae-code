@@ -3555,6 +3555,21 @@ describe("ModelRegistry", () => {
 		expect(recoveryCalls).toBe(0);
 	});
 
+	test("does not invoke credential recovery for unrelated lookup exceptions", async () => {
+		const registry = new ModelRegistry(authStorage, modelsJsonPath);
+		let recoveryCalls = 0;
+		registry.setCredentialRecovery(async () => {
+			recoveryCalls += 1;
+			return true;
+		});
+		const lookupError = new Error("unexpected credential backend failure");
+		const lookup = vi.spyOn(authStorage, "getApiKey").mockRejectedValue(lookupError);
+
+		await expect(registry.getApiKeyForProvider("openai-codex")).rejects.toBe(lookupError);
+		expect(recoveryCalls).toBe(0);
+		lookup.mockRestore();
+	});
+
 	test("does not invoke credential recovery during non-mutating model refresh", async () => {
 		const registry = new ModelRegistry(authStorage, modelsJsonPath);
 		let recoveryCalls = 0;

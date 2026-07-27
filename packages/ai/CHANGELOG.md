@@ -8,6 +8,7 @@
 ### Fixed
 
 - Anthropic subscription OAuth requests now use the current Claude Code compatibility attribution (`2.1.219`, `sdk-cli`) instead of the stale `2.1.63` CLI fingerprint that Anthropic can misclassify as extra usage.
+- Credential storage now exposes a typed pinned-selection-unavailable error and an explicit remote-store capability boundary; explicit logout advances the local credential generation even when a definitive refresh failure already removed the last active row, so in-flight consumers can cancel safely.
 
 ### Documentation
 

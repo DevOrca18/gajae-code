@@ -97,6 +97,7 @@ describe("RemoteAuthCredentialStore + AuthStorage integration", () => {
 			},
 		});
 		await clientStorage.reload();
+		expect(clientStorage.isRemoteCredentialStore()).toBe(true);
 
 		const apiKey = await clientStorage.getApiKey("anthropic");
 		expect(apiKey).toBe("server-access-rotated");

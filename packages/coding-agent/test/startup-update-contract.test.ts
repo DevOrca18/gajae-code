@@ -17,6 +17,8 @@ import type { InteractiveMode } from "../src/modes/interactive-mode";
 import type { CreateAgentSessionOptions, CreateAgentSessionResult } from "../src/sdk";
 import type { AgentSession } from "../src/session/agent-session";
 import { AuthStorage } from "../src/session/auth-storage";
+import type { ImportableCredential } from "../src/setup/credential-import";
+import * as credentialImport from "../src/setup/credential-import";
 import { EventBus } from "../src/utils/event-bus";
 
 const alternateRoutes: Array<{
@@ -709,6 +711,87 @@ describe("startup update contract", () => {
 			} finally {
 				authStorage.close();
 			}
+		}
+	}, 15_000);
+	it("wires local Codex recovery through the real main composition", async () => {
+		using tempDir = TempDir.createSync("@gjc-main-codex-recovery-");
+		const agentDir = path.join(tempDir.path(), "agent");
+		const authStorage = await AuthStorage.create(path.join(agentDir, "auth.db"), {
+			refreshOAuthCredential: async () => {
+				throw new Error("401 invalid_grant");
+			},
+		});
+		await authStorage.importCredentialIfAbsent("openai-codex", {
+			type: "oauth",
+			access: "main-stale-access",
+			refresh: "main-stale-refresh",
+			expires: Date.now() - 1,
+			accountId: "main-account",
+			email: "main@example.com",
+		});
+		await Bun.write(
+			path.join(agentDir, "credential-auto-import-state.json"),
+			`${JSON.stringify({ initialImportResolution: "accepted" })}\n`,
+		);
+		const candidate: ImportableCredential = {
+			provider: "openai-codex",
+			origin: "codex-file",
+			source: "Codex CLI (test)",
+			kind: "oauth",
+			identity: { accountId: "main-account", email: "main@example.com" },
+			expiresAt: Date.now() + 10 * 60_000,
+			redactedToken: "main…cess",
+			credential: {
+				type: "oauth",
+				access: "main-fresh-access",
+				refresh: "main-fresh-refresh",
+				expires: Date.now() + 10 * 60_000,
+				accountId: "main-account",
+				email: "main@example.com",
+			},
+		};
+		const discoverCodex = vi
+			.spyOn(credentialImport, "discoverCodexCredentials")
+			.mockResolvedValue({ importable: [candidate], skipped: [], environment: [] });
+		const stop = new Error("stop main recovery harness");
+		let resolvedKey: string | undefined;
+		resetSettingsForTest();
+		const activeSettings = await Settings.init({ cwd: tempDir.path(), agentDir });
+
+		try {
+			await expect(
+				runRootCommand(rootArgs(), [], {
+					createAgentSession: async options => {
+						const registry = options?.modelRegistry;
+						if (!registry) throw new Error("Expected main-composed model registry");
+						resolvedKey = await registry.getApiKeyForProvider("openai-codex");
+						return fakeSessionResult();
+					},
+					discoverAuthStorage: async () => authStorage,
+					settings: activeSettings,
+					suppressProcessExit: true,
+					initTheme: async () => {},
+					readPipedInput: async () => undefined,
+					stdinIsTTY: true,
+					getChangelogForDisplay: async () => undefined,
+					createInteractiveMode: () =>
+						({
+							init: async () => {},
+							showNewVersionNotification: () => {},
+							renderInitialMessages: () => {},
+							getUserInput: async () => {
+								throw stop;
+							},
+						}) as unknown as InteractiveMode,
+				}),
+			).rejects.toBe(stop);
+
+			expect(resolvedKey).toBe("main-fresh-access");
+			expect(discoverCodex).toHaveBeenCalledTimes(1);
+		} finally {
+			discoverCodex.mockRestore();
+			resetSettingsForTest();
+			authStorage.close();
 		}
 	}, 15_000);
 	it("reaches login recovery before a credentialless default profile can abort startup", async () => {

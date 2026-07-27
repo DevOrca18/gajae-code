@@ -12,6 +12,7 @@ import {
 } from "../src/setup/credential-auto-import";
 import {
 	type CredentialDiscoveryResult,
+	discoverCodexCredentials,
 	discoverExternalCredentials,
 	filterAutoImportOAuthCredentials,
 	formatCredentialSummary,
@@ -242,6 +243,30 @@ describe("discoverExternalCredentials", () => {
 		});
 		expect(keychainCalled).toBe(false);
 		expect(result.importable[0]!.origin).toBe("claude-code-file");
+	});
+
+	test("Codex-only discovery never reads Claude files, environment, or Keychain sources", async () => {
+		await writeClaude(validClaude);
+		await writeCodex(validCodexOAuth);
+		let keychainReads = 0;
+
+		const result = await discoverCodexCredentials({
+			homeDir,
+			platform: "darwin",
+			env: {
+				ANTHROPIC_API_KEY: "sk-ant-env-key-1234567890",
+				OPENAI_API_KEY: "sk-openai-env-key-0987654321",
+			},
+			readClaudeKeychain: async () => {
+				keychainReads += 1;
+				return JSON.stringify(validClaude);
+			},
+		});
+
+		expect(keychainReads).toBe(0);
+		expect(result.importable.map(credential => credential.provider)).toEqual(["openai-codex"]);
+		expect(result.skipped).toEqual([]);
+		expect(result.environment.map(hint => hint.variable)).toEqual(["OPENAI_API_KEY"]);
 	});
 
 	test("environment-backed auth is detected but not imported", async () => {
