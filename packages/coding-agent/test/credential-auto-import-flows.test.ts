@@ -409,6 +409,7 @@ describe("accepted external credential recovery", () => {
 		candidate?: ImportableCredential;
 		stateStore?: CredentialAutoImportStateStore;
 		discover?: () => Promise<CredentialDiscoveryResult>;
+		importOutcomes?: AuthCredentialIfAbsentSnapshotResult[];
 		notifyGenerationOnImport?: boolean;
 		notifyExternalGenerationOnImport?: boolean;
 	}) {
@@ -428,6 +429,8 @@ describe("accepted external credential recovery", () => {
 					expires: Date.now() + 60_000,
 				},
 			});
+		const importOutcomes = [...(options.importOutcomes ?? [])];
+		const importAttemptRefreshTokens: string[] = [];
 		const importedRefreshTokens: string[] = [];
 		let discoveryReads = 0;
 		const recover = createAcceptedExternalCredentialRecovery({
@@ -445,8 +448,12 @@ describe("accepted external credential recovery", () => {
 					};
 				},
 				importCredentialIfAbsent: async (provider, credential, importOptions) => {
-					if (credential.type === "oauth") importedRefreshTokens.push(credential.refresh);
-					if (options.notifyGenerationOnImport) {
+					const outcome = importOutcomes.shift() ?? inserted(provider);
+					if (credential.type === "oauth") {
+						importAttemptRefreshTokens.push(credential.refresh);
+						if (outcome.inserted) importedRefreshTokens.push(credential.refresh);
+					}
+					if (outcome.inserted && options.notifyGenerationOnImport) {
 						generation += 1;
 						generationListener?.(generation, {
 							kind: "credential-import",
@@ -454,11 +461,11 @@ describe("accepted external credential recovery", () => {
 							...(importOptions?.mutationToken ? { mutationToken: importOptions.mutationToken } : {}),
 						});
 					}
-					if (options.notifyExternalGenerationOnImport) {
+					if (outcome.inserted && options.notifyExternalGenerationOnImport) {
 						generation += 1;
 						generationListener?.(generation, { kind: "mutation", provider });
 					}
-					return inserted(provider);
+					return outcome;
 				},
 			},
 			modelRegistry: { refresh: async () => {} },
@@ -525,6 +532,7 @@ describe("accepted external credential recovery", () => {
 			replaceCandidate: (next: ImportableCredential) => {
 				candidate = next;
 			},
+			importAttemptRefreshTokens,
 			importedRefreshTokens,
 			get discoveryReads() {
 				return discoveryReads;
@@ -725,6 +733,7 @@ describe("accepted external credential recovery", () => {
 		];
 		const harness = createHarness({
 			notifyGenerationOnImport: true,
+			importOutcomes: [inserted("openai-codex"), skipped("openai-codex")],
 			discover: async () => {
 				discoveryCalls += 1;
 				if (discoveryCalls === 1) {
@@ -745,8 +754,9 @@ describe("accepted external credential recovery", () => {
 		} finally {
 			releaseFirstDiscovery.resolve();
 		}
-		expect(await firstRecovery).toBe(true);
-		expect(harness.importedRefreshTokens.sort()).toEqual(["first-refresh", "second-refresh"]);
+		expect(await firstRecovery).toBe(false);
+		expect(harness.importAttemptRefreshTokens).toEqual(["second-refresh", "first-refresh"]);
+		expect(harness.importedRefreshTokens).toEqual(["second-refresh"]);
 	});
 
 	test("cancels other selector triggers on a nested external generation during recovery import", async () => {
