@@ -7,6 +7,7 @@ import {
 	applyFinalCodexGpt56ContextCap,
 	type CacheRetention,
 	type Context,
+	createCredentialRecoveryKey,
 	createModelManager,
 	enrichModelThinking,
 	getBundledModels,
@@ -77,7 +78,7 @@ export type { CanonicalModelIndex, CanonicalModelRecord, CanonicalModelVariant, 
 
 export { isAuthenticated, kNoAuth };
 
-export type CredentialRecovery = (provider: string) => Promise<boolean>;
+export type CredentialRecovery = (provider: string, selector?: AuthCredentialSelector) => Promise<boolean>;
 
 const MAX_SESSION_CANONICAL_VARIANTS = 64;
 
@@ -2568,27 +2569,28 @@ export class ModelRegistry {
 	 *
 	 * The callback runs only after normal credential lookup returns no key or a
 	 * pinned lookup reports that its selected credential became unavailable.
-	 * Calls for the same provider share one recovery attempt, then retry the
-	 * original lookup exactly once when recovery reports success.
+	 * Calls for the same provider and equivalent selector share one recovery
+	 * attempt, then retry the original lookup exactly once on success.
 	 */
 	setCredentialRecovery(recovery?: CredentialRecovery): void {
 		this.#credentialRecovery = recovery;
 	}
 
-	async #recoverCredential(provider: string): Promise<boolean> {
+	async #recoverCredential(provider: string, selector?: AuthCredentialSelector): Promise<boolean> {
 		if (!this.#credentialRecovery) return false;
-		const existing = this.#credentialRecoveryInFlight.get(provider);
+		const recoveryKey = createCredentialRecoveryKey(provider, selector);
+		const existing = this.#credentialRecoveryInFlight.get(recoveryKey);
 		if (existing) return existing;
 		const recovery = this.#credentialRecovery;
-		const attempt = recovery(provider)
+		const attempt = recovery(provider, selector)
 			.catch(() => {
 				logger.warn("Credential recovery failed", { provider, classification: "callback-failed" });
 				return false;
 			})
 			.finally(() => {
-				this.#credentialRecoveryInFlight.delete(provider);
+				this.#credentialRecoveryInFlight.delete(recoveryKey);
 			});
-		this.#credentialRecoveryInFlight.set(provider, attempt);
+		this.#credentialRecoveryInFlight.set(recoveryKey, attempt);
 		return attempt;
 	}
 
@@ -2608,7 +2610,7 @@ export class ModelRegistry {
 				!(error instanceof SelectedCredentialUnavailableError) ||
 				error.provider !== provider ||
 				!allowRecovery ||
-				!(await this.#recoverCredential(provider))
+				!(await this.#recoverCredential(provider, error.selector))
 			) {
 				throw error;
 			}

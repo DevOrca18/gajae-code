@@ -8,6 +8,7 @@
  * - `SqliteAuthCredentialStore`: concrete SQLite-backed implementation
  */
 import { Database, type Statement } from "bun:sqlite";
+import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { getAgentDbPath, logger } from "@gajae-code/utils";
@@ -425,14 +426,51 @@ export interface AuthCredentialStore {
 export interface CredentialDisabledEvent {
 	provider: string;
 	disabledCause: string;
+	/**
+	 * Opaque ownership key for a selector-scoped recovery trigger.
+	 *
+	 * Absent when the disable came from an unpinned lookup. The key deliberately
+	 * contains no raw email, account, project, or credential material.
+	 */
+	recoveryKey?: string;
 }
+
+export type AuthStorageGenerationKind = "mutation" | "credential-disabled" | "credential-import";
+
+/**
+ * Classifies the mutation behind an {@link AuthStorage} generation change.
+ *
+ * `mutationToken` is caller-owned, process-local identity. It is never
+ * persisted or transported through the auth broker.
+ */
+export interface AuthStorageGenerationEvent {
+	kind: AuthStorageGenerationKind;
+	provider?: string;
+	mutationToken?: symbol;
+	recoveryKey?: string;
+}
+
+export interface AuthCredentialImportOptions {
+	/**
+	 * Optional caller-owned identity echoed to local generation listeners.
+	 * This lets a caller recognize only its own write without suppressing
+	 * unrelated nested mutations.
+	 */
+	mutationToken?: symbol;
+}
+
+export type AuthStorageGenerationListener = (generation: number, event?: AuthStorageGenerationEvent) => void;
+type AuthStorageGenerationMutation = Omit<AuthStorageGenerationEvent, "provider">;
+
 export class SelectedCredentialUnavailableError extends Error {
 	readonly provider: string;
+	readonly selector: AuthCredentialSelector;
 
-	constructor(provider: string, selector: string) {
-		super(`Selected credential for ${provider} (${selector}) is unavailable`);
+	constructor(provider: string, selector: AuthCredentialSelector) {
+		super(`Selected credential for ${provider} (${selector.kind}:${selector.value}) is unavailable`);
 		this.name = "SelectedCredentialUnavailableError";
 		this.provider = provider;
+		this.selector = { ...selector };
 	}
 }
 
@@ -618,6 +656,14 @@ export type AuthCredentialSelectorKind = "id" | "email" | "account" | "project";
 export interface AuthCredentialSelector {
 	kind: AuthCredentialSelectorKind;
 	value: string;
+}
+
+export function createCredentialRecoveryKey(provider: string, selector?: AuthCredentialSelector): string {
+	if (!selector) return JSON.stringify([provider]);
+	const value = selector.kind === "email" ? selector.value.toLowerCase() : selector.value;
+	return createHash("sha256")
+		.update(JSON.stringify([provider, selector.kind, value]))
+		.digest("hex");
 }
 
 type OAuthResolutionResult = { apiKey: string; credential: OAuthCredential };
@@ -857,7 +903,7 @@ export class AuthStorage {
 	 */
 	#pendingDisabledEvents: CredentialDisabledEvent[] = [];
 	#generation = 1;
-	#generationListeners: Set<(generation: number) => void> = new Set();
+	#generationListeners: Set<AuthStorageGenerationListener> = new Set();
 	#oauthRefreshInFlight: Map<number, Promise<AuthCredentialSnapshotEntry>> = new Map();
 	#oauthCredentialRefreshInFlight: Map<number, Promise<OAuthCredentials>> = new Map();
 	#closed = false;
@@ -923,22 +969,22 @@ export class AuthStorage {
 		return this.#store.upsertAuthCredentialRemoteIfAbsent !== undefined;
 	}
 
-	onGenerationChanged(listener: (generation: number) => void): () => void {
+	onGenerationChanged(listener: AuthStorageGenerationListener): () => void {
 		this.#generationListeners.add(listener);
 		return () => {
 			this.#generationListeners.delete(listener);
 		};
 	}
 
-	offGenerationChanged(listener: (generation: number) => void): void {
+	offGenerationChanged(listener: AuthStorageGenerationListener): void {
 		this.#generationListeners.delete(listener);
 	}
 
-	#bumpGeneration(reason: string): void {
+	#bumpGeneration(reason: string, event: AuthStorageGenerationEvent = { kind: "mutation" }): void {
 		this.#generation += 1;
 		for (const listener of [...this.#generationListeners]) {
 			try {
-				listener(this.#generation);
+				listener(this.#generation, event);
 			} catch (error) {
 				logger.debug("AuthStorage generation listener failed", { reason, error: String(error) });
 			}
@@ -1102,7 +1148,11 @@ export class AuthStorage {
 	 * @param provider - Provider name (e.g., "anthropic", "openai")
 	 * @param credentials - Array of stored credentials to cache
 	 */
-	#setStoredCredentials(provider: string, credentials: StoredCredential[]): void {
+	#setStoredCredentials(
+		provider: string,
+		credentials: StoredCredential[],
+		generationMutation: AuthStorageGenerationMutation = { kind: "mutation" },
+	): void {
 		const current = this.#data.get(provider) ?? [];
 		if (storedCredentialArraysEqual(current, credentials)) return;
 		if (credentials.length === 0) {
@@ -1110,7 +1160,10 @@ export class AuthStorage {
 		} else {
 			this.#data.set(provider, credentials);
 		}
-		this.#bumpGeneration("credentials");
+		this.#bumpGeneration("credentials", {
+			...generationMutation,
+			provider,
+		});
 	}
 
 	#resolveOAuthDedupeIdentityKey(provider: string, credential: OAuthCredential): string | null {
@@ -1429,6 +1482,7 @@ export class AuthStorage {
 		index: number,
 		expectedCredential: AuthCredential,
 		disabledCause: string,
+		recoveryKey?: string,
 	): boolean {
 		const entries = this.#getStoredCredentials(provider);
 		if (index < 0 || index >= entries.length) return false;
@@ -1438,9 +1492,12 @@ export class AuthStorage {
 		const disabled = this.#store.tryDisableAuthCredentialIfMatches(target.id, serialized.data, disabledCause);
 		if (!disabled) return false;
 		const updated = entries.filter((_value, idx) => idx !== index);
-		this.#setStoredCredentials(provider, updated);
+		this.#setStoredCredentials(provider, updated, {
+			kind: "credential-disabled",
+			recoveryKey: recoveryKey ?? createCredentialRecoveryKey(provider),
+		});
 		this.#resetProviderAssignments(provider);
-		this.#emitCredentialDisabled({ provider, disabledCause });
+		this.#emitCredentialDisabled({ provider, disabledCause, ...(recoveryKey ? { recoveryKey } : {}) });
 		return true;
 	}
 
@@ -1530,6 +1587,7 @@ export class AuthStorage {
 	async importCredentialIfAbsent(
 		provider: string,
 		credential: AuthCredential,
+		options?: AuthCredentialImportOptions,
 	): Promise<AuthCredentialIfAbsentSnapshotResult> {
 		const storageProvider = resolveOAuthStorageProvider(provider);
 		if (this.#runtimeOverrides.has(storageProvider))
@@ -1546,6 +1604,10 @@ export class AuthStorage {
 		this.#setStoredCredentials(
 			storageProvider,
 			result.entries.map(entry => ({ id: entry.id, credential: entry.credential })),
+			{
+				kind: "credential-import",
+				...(options?.mutationToken ? { mutationToken: options.mutationToken } : {}),
+			},
 		);
 		this.#resetProviderAssignments(storageProvider);
 		if (result.inserted) this.#invalidateUsageCacheForProvider(storageProvider);
@@ -3010,7 +3072,16 @@ export class AuthStorage {
 		sessionId?: string,
 		options?: AuthApiKeyOptions,
 	): Promise<OAuthResolutionResult | undefined> {
-		const selectedCredential = this.#resolveSelectedStoredCredential(provider, options);
+		const requestedSelector = this.#getCredentialSelector(provider, options);
+		const credentialSelector = requestedSelector ? { ...requestedSelector } : undefined;
+		const selectedCredential = credentialSelector
+			? this.#findCredentialBySelector(provider, credentialSelector)
+			: undefined;
+		if (credentialSelector && !selectedCredential) {
+			throw new SelectedCredentialUnavailableError(provider, credentialSelector);
+		}
+		const recoveryKey = credentialSelector ? createCredentialRecoveryKey(provider, credentialSelector) : undefined;
+		const selectionOptions = credentialSelector ? { ...(options ?? {}), credentialSelector } : options;
 		const selectedOAuthCredential =
 			selectedCredential?.credential.type === "oauth"
 				? { credential: selectedCredential.credential, index: selectedCredential.index }
@@ -3099,7 +3170,9 @@ export class AuthStorage {
 				candidate.selection,
 				providerKey,
 				sessionId,
-				options,
+				selectionOptions,
+				credentialSelector,
+				recoveryKey,
 				{
 					checkUsage,
 					allowBlocked: false,
@@ -3112,13 +3185,22 @@ export class AuthStorage {
 		}
 
 		if (fallback && this.#isCredentialBlocked(providerKey, fallback.selection.index)) {
-			return this.#tryOAuthCredential(provider, fallback.selection, providerKey, sessionId, options, {
-				checkUsage,
-				allowBlocked: true,
-				prefetchedUsage: fallback.usage,
-				usagePrechecked: fallback.usageChecked,
-				enforceProRequirement,
-			});
+			return this.#tryOAuthCredential(
+				provider,
+				fallback.selection,
+				providerKey,
+				sessionId,
+				selectionOptions,
+				credentialSelector,
+				recoveryKey,
+				{
+					checkUsage,
+					allowBlocked: true,
+					prefetchedUsage: fallback.usage,
+					usagePrechecked: fallback.usageChecked,
+					enforceProRequirement,
+				},
+			);
 		}
 
 		return undefined;
@@ -3232,6 +3314,8 @@ export class AuthStorage {
 		providerKey: string,
 		sessionId: string | undefined,
 		options: AuthApiKeyOptions | undefined,
+		credentialSelector: AuthCredentialSelector | undefined,
+		recoveryKey: string | undefined,
 		usageOptions: {
 			checkUsage: boolean;
 			allowBlocked: boolean;
@@ -3405,6 +3489,7 @@ export class AuthStorage {
 					selection.index,
 					selection.credential,
 					`oauth refresh failed: ${errorMsg}`,
+					recoveryKey,
 				);
 				if (!disabled) {
 					logger.debug("OAuth refresh disable lost CAS; reloading after peer rotation", {
@@ -3415,7 +3500,7 @@ export class AuthStorage {
 					return this.#resolveOAuthSelection(provider, sessionId, options);
 				}
 				if (
-					!this.#getCredentialSelector(provider, options) &&
+					!credentialSelector &&
 					this.#getCredentialsForProvider(provider).some(credential => credential.type === "oauth")
 				) {
 					return this.#resolveOAuthSelection(provider, sessionId, options);
@@ -3425,13 +3510,7 @@ export class AuthStorage {
 				this.#markCredentialBlocked(providerKey, selection.index, Date.now() + 5 * 60 * 1000);
 			}
 		}
-		if (this.#getCredentialSelector(provider, options)) {
-			const selector = this.#getCredentialSelector(provider, options);
-			throw new SelectedCredentialUnavailableError(
-				provider,
-				selector ? this.#formatCredentialSelector(selector) : "unknown",
-			);
-		}
+		if (credentialSelector) throw new SelectedCredentialUnavailableError(provider, credentialSelector);
 
 		return undefined;
 	}

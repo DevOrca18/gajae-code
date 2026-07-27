@@ -2,7 +2,15 @@ import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { type AuthCredentialIfAbsentSnapshotResult, AuthStorage } from "@gajae-code/ai";
+import {
+	type AuthCredentialIfAbsentSnapshotResult,
+	type AuthCredentialSelector,
+	AuthStorage,
+	type AuthStorageGenerationEvent,
+	type CredentialDisabledEvent,
+	createCredentialRecoveryKey,
+	SelectedCredentialUnavailableError,
+} from "@gajae-code/ai";
 import { Container } from "@gajae-code/tui";
 import { logger, VERSION } from "@gajae-code/utils";
 
@@ -401,9 +409,12 @@ describe("accepted external credential recovery", () => {
 		candidate?: ImportableCredential;
 		stateStore?: CredentialAutoImportStateStore;
 		discover?: () => Promise<CredentialDiscoveryResult>;
+		notifyGenerationOnImport?: boolean;
+		notifyExternalGenerationOnImport?: boolean;
 	}) {
-		let disabledListener: ((event: { provider: string; disabledCause: string }) => void | Promise<void>) | undefined;
-		let generationListener: ((generation: number) => void) | undefined;
+		let disabledListener: ((event: CredentialDisabledEvent) => void | Promise<void>) | undefined;
+		let generationListener: ((generation: number, event?: AuthStorageGenerationEvent) => void) | undefined;
+		let generation = 1;
 		let candidate =
 			options.candidate ??
 			oauthCredential({
@@ -433,8 +444,20 @@ describe("accepted external credential recovery", () => {
 						generationListener = undefined;
 					};
 				},
-				importCredentialIfAbsent: async (provider, credential) => {
+				importCredentialIfAbsent: async (provider, credential, importOptions) => {
 					if (credential.type === "oauth") importedRefreshTokens.push(credential.refresh);
+					if (options.notifyGenerationOnImport) {
+						generation += 1;
+						generationListener?.(generation, {
+							kind: "credential-import",
+							provider,
+							...(importOptions?.mutationToken ? { mutationToken: importOptions.mutationToken } : {}),
+						});
+					}
+					if (options.notifyExternalGenerationOnImport) {
+						generation += 1;
+						generationListener?.(generation, { kind: "mutation", provider });
+					}
 					return inserted(provider);
 				},
 			},
@@ -450,10 +473,54 @@ describe("accepted external credential recovery", () => {
 		return {
 			recover,
 			emitDisabled: async (disabledCause = "oauth refresh failed: invalid_grant") => {
+				generation += 1;
+				const recoverable = disabledCause.startsWith("oauth refresh failed:");
+				generationListener?.(generation, {
+					kind: recoverable ? "credential-disabled" : "mutation",
+					provider: "openai-codex",
+					...(recoverable ? { recoveryKey: createCredentialRecoveryKey("openai-codex") } : {}),
+				});
 				await disabledListener?.({ provider: "openai-codex", disabledCause });
 			},
-			emitGenerationChanged: (generation = 2) => {
-				generationListener?.(generation);
+			emitSelectedDisabled: async (
+				selector: AuthCredentialSelector,
+				disabledCause = "oauth refresh failed: invalid_grant",
+			) => {
+				generation += 1;
+				const recoverable = disabledCause.startsWith("oauth refresh failed:");
+				generationListener?.(generation, {
+					kind: recoverable ? "credential-disabled" : "mutation",
+					provider: "openai-codex",
+					...(recoverable ? { recoveryKey: createCredentialRecoveryKey("openai-codex", selector) } : {}),
+				});
+				await disabledListener?.({
+					provider: "openai-codex",
+					disabledCause,
+					recoveryKey: createCredentialRecoveryKey("openai-codex", selector),
+				});
+			},
+			emitSelectedDisabledAfterExternalGeneration: async (selector: AuthCredentialSelector) => {
+				const recoveryKey = createCredentialRecoveryKey("openai-codex", selector);
+				generation += 1;
+				generationListener?.(generation, {
+					kind: "credential-disabled",
+					provider: "openai-codex",
+					recoveryKey,
+				});
+				generation += 1;
+				generationListener?.(generation, {
+					kind: "mutation",
+					provider: "openai-codex",
+				});
+				await disabledListener?.({
+					provider: "openai-codex",
+					disabledCause: "oauth refresh failed: invalid_grant",
+					recoveryKey,
+				});
+			},
+			emitGenerationChanged: (nextGeneration = generation + 1) => {
+				generation = nextGeneration;
+				generationListener?.(generation, { kind: "mutation" });
 			},
 			replaceCandidate: (next: ImportableCredential) => {
 				candidate = next;
@@ -529,6 +596,308 @@ describe("accepted external credential recovery", () => {
 		await harness.emitDisabled();
 		expect(await harness.recover("openai-codex")).toBe(true);
 		expect(harness.importedRefreshTokens).toEqual(["codex-refresh-1", "codex-refresh-2"]);
+	});
+
+	test("matches account and project selectors against the stored OAuth payload", async () => {
+		const accountSelector = { kind: "account" as const, value: "payload-account" };
+		const account = createHarness({
+			candidate: oauthCredential({
+				provider: "openai-codex",
+				origin: "codex-file",
+				identity: { accountId: "display-account" },
+				credential: {
+					type: "oauth",
+					access: "account-access",
+					refresh: "account-refresh",
+					expires: Date.now() + 60_000,
+					accountId: "payload-account",
+				},
+			}),
+		});
+		await account.emitSelectedDisabled(accountSelector);
+		expect(await account.recover("openai-codex", accountSelector)).toBe(true);
+		expect(account.importedRefreshTokens).toEqual(["account-refresh"]);
+
+		const projectSelector = { kind: "project" as const, value: "payload-project" };
+		const project = createHarness({
+			candidate: oauthCredential({
+				provider: "openai-codex",
+				origin: "codex-file",
+				credential: {
+					type: "oauth",
+					access: "project-access",
+					refresh: "project-refresh",
+					expires: Date.now() + 60_000,
+					projectId: "payload-project",
+				},
+			}),
+		});
+		await project.emitSelectedDisabled(projectSelector);
+		expect(await project.recover("openai-codex", projectSelector)).toBe(true);
+		expect(project.importedRefreshTokens).toEqual(["project-refresh"]);
+	});
+
+	test("rejects an account selector when only the display identity matches", async () => {
+		const selector = { kind: "account" as const, value: "pinned-account" };
+		const harness = createHarness({
+			candidate: oauthCredential({
+				provider: "openai-codex",
+				origin: "codex-file",
+				identity: { accountId: "pinned-account" },
+				credential: {
+					type: "oauth",
+					access: "other-account-access",
+					refresh: "other-account-refresh",
+					expires: Date.now() + 60_000,
+					accountId: "other-account",
+				},
+			}),
+		});
+		await harness.emitSelectedDisabled(selector);
+
+		expect(await harness.recover("openai-codex", selector)).toBe(false);
+		expect(harness.importedRefreshTokens).toEqual([]);
+		expect(harness.discoveryReads).toBe(1);
+	});
+
+	test("fails closed for a local row-id selector", async () => {
+		const selector = { kind: "id" as const, value: "1" };
+		const harness = createHarness({});
+		await harness.emitSelectedDisabled(selector);
+
+		expect(await harness.recover("openai-codex", selector)).toBe(false);
+		expect(harness.importedRefreshTokens).toEqual([]);
+		expect(harness.discoveryReads).toBe(1);
+	});
+
+	test("does not let an unpinned recovery consume a selector-scoped disable trigger", async () => {
+		const selector = { kind: "email" as const, value: "pinned@example.com" };
+		const harness = createHarness({
+			candidate: oauthCredential({
+				provider: "openai-codex",
+				origin: "codex-file",
+				credential: {
+					type: "oauth",
+					access: "pinned-access",
+					refresh: "pinned-refresh",
+					expires: Date.now() + 60_000,
+					email: selector.value,
+				},
+			}),
+		});
+		await harness.emitSelectedDisabled(selector);
+
+		expect(await harness.recover("openai-codex")).toBe(false);
+		expect(harness.discoveryReads).toBe(0);
+		expect(await harness.recover("openai-codex", selector)).toBe(true);
+		expect(harness.importedRefreshTokens).toEqual(["pinned-refresh"]);
+	});
+
+	test("keeps concurrent recovery triggers isolated across distinct selectors", async () => {
+		const firstSelector = { kind: "email" as const, value: "first@example.com" };
+		const secondSelector = { kind: "email" as const, value: "second@example.com" };
+		const firstDiscoveryStarted = Promise.withResolvers<void>();
+		const releaseFirstDiscovery = Promise.withResolvers<void>();
+		let discoveryCalls = 0;
+		const candidates = [
+			oauthCredential({
+				provider: "openai-codex",
+				origin: "codex-file",
+				credential: {
+					type: "oauth",
+					access: "first-access",
+					refresh: "first-refresh",
+					expires: Date.now() + 60_000,
+					email: firstSelector.value,
+				},
+			}),
+			oauthCredential({
+				provider: "openai-codex",
+				origin: "codex-file",
+				credential: {
+					type: "oauth",
+					access: "second-access",
+					refresh: "second-refresh",
+					expires: Date.now() + 60_000,
+					email: secondSelector.value,
+				},
+			}),
+		];
+		const harness = createHarness({
+			notifyGenerationOnImport: true,
+			discover: async () => {
+				discoveryCalls += 1;
+				if (discoveryCalls === 1) {
+					firstDiscoveryStarted.resolve();
+					await releaseFirstDiscovery.promise;
+				}
+				return discovery(candidates);
+			},
+		});
+		await harness.emitSelectedDisabled(firstSelector);
+		await harness.emitSelectedDisabled(secondSelector);
+
+		const firstRecovery = harness.recover("openai-codex", firstSelector);
+		await firstDiscoveryStarted.promise;
+		const secondRecovery = harness.recover("openai-codex", secondSelector);
+		try {
+			expect(await secondRecovery).toBe(true);
+		} finally {
+			releaseFirstDiscovery.resolve();
+		}
+		expect(await firstRecovery).toBe(true);
+		expect(harness.importedRefreshTokens.sort()).toEqual(["first-refresh", "second-refresh"]);
+	});
+
+	test("cancels other selector triggers on a nested external generation during recovery import", async () => {
+		const firstSelector = { kind: "email" as const, value: "first@example.com" };
+		const secondSelector = { kind: "email" as const, value: "second@example.com" };
+		let discoveryReads = 0;
+		const harness = createHarness({
+			notifyGenerationOnImport: true,
+			notifyExternalGenerationOnImport: true,
+			discover: async () => {
+				discoveryReads += 1;
+				return discovery([
+					oauthCredential({
+						provider: "openai-codex",
+						origin: "codex-file",
+						credential: {
+							type: "oauth",
+							access: "first-access",
+							refresh: "first-refresh",
+							expires: Date.now() + 60_000,
+							email: firstSelector.value,
+						},
+					}),
+					oauthCredential({
+						provider: "openai-codex",
+						origin: "codex-file",
+						credential: {
+							type: "oauth",
+							access: "second-access",
+							refresh: "second-refresh",
+							expires: Date.now() + 60_000,
+							email: secondSelector.value,
+						},
+					}),
+				]);
+			},
+		});
+		await harness.emitSelectedDisabled(firstSelector);
+		await harness.emitSelectedDisabled(secondSelector);
+
+		expect(await harness.recover("openai-codex", firstSelector)).toBe(true);
+		expect(await harness.recover("openai-codex", secondSelector)).toBe(false);
+		expect(discoveryReads).toBe(1);
+		expect(harness.importedRefreshTokens).toEqual(["first-refresh"]);
+	});
+
+	test("does not re-arm a disable trigger after a nested external generation", async () => {
+		const selector = { kind: "email" as const, value: "pinned@example.com" };
+		const harness = createHarness({});
+
+		await harness.emitSelectedDisabledAfterExternalGeneration(selector);
+
+		expect(await harness.recover("openai-codex", selector)).toBe(false);
+		expect(harness.discoveryReads).toBe(0);
+		expect(harness.importedRefreshTokens).toEqual([]);
+	});
+
+	test("preserves real selector triggers across sequential definitive disables", async () => {
+		const agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-codex-trigger-order-"));
+		const firstSelector = { kind: "email" as const, value: "first@example.com" };
+		const secondSelector = { kind: "email" as const, value: "second@example.com" };
+		let authStorage: AuthStorage | undefined;
+		try {
+			authStorage = await AuthStorage.create(path.join(agentDir, "agent.db"), {
+				refreshOAuthCredential: async () => {
+					throw new Error("401 invalid_grant");
+				},
+			});
+			await authStorage.set("openai-codex", [
+				{
+					type: "oauth",
+					access: "stale-first-access",
+					refresh: "stale-first-refresh",
+					expires: Date.now() - 1,
+					accountId: "first-account",
+					email: firstSelector.value,
+				},
+				{
+					type: "oauth",
+					access: "stale-second-access",
+					refresh: "stale-second-refresh",
+					expires: Date.now() - 1,
+					accountId: "second-account",
+					email: secondSelector.value,
+				},
+			]);
+			let discoveryReads = 0;
+			const recover = createAcceptedExternalCredentialRecovery({
+				authStorage,
+				modelRegistry: { refresh: async () => {} },
+				stateStore: stateStore("accepted"),
+				discover: async () => {
+					discoveryReads += 1;
+					return discovery([
+						oauthCredential({
+							provider: "openai-codex",
+							origin: "codex-file",
+							credential: {
+								type: "oauth",
+								access: "fresh-first-access",
+								refresh: "fresh-first-refresh",
+								expires: Date.now() + 10 * 60_000,
+								accountId: "first-account",
+								email: firstSelector.value,
+							},
+						}),
+						oauthCredential({
+							provider: "openai-codex",
+							origin: "codex-file",
+							credential: {
+								type: "oauth",
+								access: "fresh-second-access",
+								refresh: "fresh-second-refresh",
+								expires: Date.now() + 10 * 60_000,
+								accountId: "second-account",
+								email: secondSelector.value,
+							},
+						}),
+					]);
+				},
+			});
+			const disable = async (selector: AuthCredentialSelector): Promise<void> => {
+				const error = await authStorage
+					?.getApiKey("openai-codex", undefined, { credentialSelector: selector })
+					.then(
+						() => undefined,
+						reason => reason,
+					);
+				expect(error).toBeInstanceOf(SelectedCredentialUnavailableError);
+			};
+
+			await disable(firstSelector);
+			await disable(secondSelector);
+
+			expect(await recover("openai-codex", firstSelector)).toBe(true);
+			expect(await recover("openai-codex", secondSelector)).toBe(false);
+			expect(discoveryReads).toBe(2);
+			expect(
+				await authStorage.getApiKey("openai-codex", undefined, {
+					credentialSelector: firstSelector,
+				}),
+			).toBe("fresh-first-access");
+			expect(authStorage.exportSnapshot().credentials).toHaveLength(1);
+			expect(authStorage.exportSnapshot().credentials[0]?.credential).toMatchObject({
+				type: "oauth",
+				email: firstSelector.value,
+			});
+		} finally {
+			authStorage?.close();
+			await fs.rm(agentDir, { recursive: true, force: true });
+		}
 	});
 
 	test("preserves an armed trigger across unreadable and malformed consent state", async () => {
@@ -836,8 +1205,127 @@ describe("accepted external credential recovery", () => {
 		}
 	});
 
+	test("preserves the selector that started a pinned lookup across an in-flight selector change", async () => {
+		const agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-pinned-codex-selector-race-"));
+		const refreshStarted = Promise.withResolvers<void>();
+		const releaseRefresh = Promise.withResolvers<void>();
+		let authStorage: AuthStorage | undefined;
+		try {
+			authStorage = await AuthStorage.create(path.join(agentDir, "agent.db"), {
+				refreshOAuthCredential: async () => {
+					refreshStarted.resolve();
+					await releaseRefresh.promise;
+					throw new Error("401 invalid_grant");
+				},
+			});
+			await authStorage.set("openai-codex", [
+				{
+					type: "oauth",
+					access: "stale-first-access",
+					refresh: "stale-first-refresh",
+					expires: Date.now() - 1,
+					accountId: "account-first",
+					email: "first@example.com",
+				},
+				{
+					type: "oauth",
+					access: "fresh-second-access",
+					refresh: "fresh-second-refresh",
+					expires: Date.now() + 10 * 60_000,
+					accountId: "account-second",
+					email: "second@example.com",
+				},
+			]);
+			authStorage.setRuntimeCredentialSelector("openai-codex", {
+				kind: "email",
+				value: "first@example.com",
+			});
+
+			const outcome = authStorage.getApiKey("openai-codex").then(
+				value => value,
+				error => error,
+			);
+			await refreshStarted.promise;
+			authStorage.setRuntimeCredentialSelector("openai-codex", {
+				kind: "email",
+				value: "second@example.com",
+			});
+			releaseRefresh.resolve();
+
+			const error = await outcome;
+			expect(error).toBeInstanceOf(SelectedCredentialUnavailableError);
+			if (!(error instanceof SelectedCredentialUnavailableError)) {
+				throw new Error("Expected typed selected credential failure");
+			}
+			expect(error.selector).toEqual({ kind: "email", value: "first@example.com" });
+		} finally {
+			releaseRefresh.resolve();
+			authStorage?.close();
+			await fs.rm(agentDir, { recursive: true, force: true });
+		}
+	});
+
 	test("retries a pinned lookup only after its selected credential is definitively disabled", async () => {
 		const agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-pinned-codex-oauth-recovery-"));
+		let authStorage: AuthStorage | undefined;
+		try {
+			authStorage = await AuthStorage.create(path.join(agentDir, "agent.db"), {
+				refreshOAuthCredential: async () => {
+					throw new Error("401 invalid_grant");
+				},
+			});
+			await authStorage.importCredentialIfAbsent("openai-codex", {
+				type: "oauth",
+				access: "stale-pinned-access",
+				refresh: "stale-pinned-refresh",
+				expires: Date.now() - 1,
+				accountId: "account-pinned",
+				email: "pinned@example.com",
+			});
+			authStorage.setRuntimeCredentialSelector("openai-codex", {
+				kind: "email",
+				value: "PINNED@EXAMPLE.COM",
+			});
+			const registry = new ModelRegistry(authStorage, path.join(agentDir, "models.yml"));
+			let discoveryReads = 0;
+			registry.setCredentialRecovery(
+				createAcceptedExternalCredentialRecovery({
+					authStorage,
+					modelRegistry: registry,
+					stateStore: stateStore("accepted"),
+					discover: async () => {
+						discoveryReads += 1;
+						return discovery([
+							oauthCredential({
+								provider: "openai-codex",
+								origin: "codex-file",
+								source: "Codex CLI (test)",
+								identity: { accountId: "account-pinned", email: "pinned@example.com" },
+								credential: {
+									type: "oauth",
+									access: "fresh-pinned-access",
+									refresh: "fresh-pinned-refresh",
+									expires: Date.now() + 10 * 60_000,
+									accountId: "account-pinned",
+									email: "pinned@example.com",
+								},
+								expiresAt: Date.now() + 10 * 60_000,
+							}),
+						]);
+					},
+				}),
+			);
+
+			expect(await registry.getApiKeyForProvider("openai-codex")).toBe("fresh-pinned-access");
+			expect(discoveryReads).toBe(1);
+		} finally {
+			authStorage?.close();
+			await fs.rm(agentDir, { recursive: true, force: true });
+		}
+	});
+
+	test("does not import a Codex credential that belongs to a different pinned identity", async () => {
+		const agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-pinned-codex-oauth-identity-mismatch-"));
 		let authStorage: AuthStorage | undefined;
 		try {
 			authStorage = await AuthStorage.create(path.join(agentDir, "agent.db"), {
@@ -874,11 +1362,11 @@ describe("accepted external credential recovery", () => {
 								identity: { accountId: "account-pinned", email: "pinned@example.com" },
 								credential: {
 									type: "oauth",
-									access: "fresh-pinned-access",
-									refresh: "fresh-pinned-refresh",
+									access: "other-access",
+									refresh: "other-refresh",
 									expires: Date.now() + 10 * 60_000,
-									accountId: "account-pinned",
-									email: "pinned@example.com",
+									accountId: "account-other",
+									email: "other@example.com",
 								},
 								expiresAt: Date.now() + 10 * 60_000,
 							}),
@@ -887,8 +1375,17 @@ describe("accepted external credential recovery", () => {
 				}),
 			);
 
-			expect(await registry.getApiKeyForProvider("openai-codex")).toBe("fresh-pinned-access");
+			const error = await registry.getApiKeyForProvider("openai-codex").then(
+				() => undefined,
+				reason => reason,
+			);
+			expect(error).toBeInstanceOf(SelectedCredentialUnavailableError);
+			if (!(error instanceof SelectedCredentialUnavailableError)) {
+				throw new Error("Expected typed selected credential failure");
+			}
+			expect(error.selector).toEqual({ kind: "email", value: "pinned@example.com" });
 			expect(discoveryReads).toBe(1);
+			expect(authStorage.has("openai-codex")).toBe(false);
 		} finally {
 			authStorage?.close();
 			await fs.rm(agentDir, { recursive: true, force: true });

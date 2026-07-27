@@ -1,12 +1,14 @@
 import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import type {
-	AuthCredential,
-	AuthCredentialIfAbsentReason,
-	AuthCredentialIfAbsentSnapshotResult,
-	AuthStorage,
-	CredentialDisabledEvent,
+import {
+	type AuthCredential,
+	type AuthCredentialIfAbsentReason,
+	type AuthCredentialIfAbsentSnapshotResult,
+	type AuthCredentialSelector,
+	type AuthStorage,
+	type CredentialDisabledEvent,
+	createCredentialRecoveryKey,
 } from "@gajae-code/ai";
 import { getAgentDir, logger, VERSION } from "@gajae-code/utils";
 import { withFileLock } from "../config/file-lock";
@@ -530,45 +532,83 @@ function scopeCodexDiscovery(discovered: CredentialDiscoveryResult): CredentialD
 	};
 }
 
+// Match only fields from the payload that importCredentialIfAbsent will store;
+// display identity is redacted metadata and is not authoritative.
+function matchesCredentialSelector(candidate: ImportableCredential, selector: AuthCredentialSelector): boolean {
+	const credential = candidate.credential;
+	if (credential.type !== "oauth") return false;
+	switch (selector.kind) {
+		case "email":
+			return typeof credential.email === "string" && credential.email.toLowerCase() === selector.value.toLowerCase();
+		case "account":
+			return credential.accountId === selector.value;
+		case "project":
+			return credential.projectId === selector.value;
+		case "id":
+			return false;
+	}
+}
+
 export function createAcceptedExternalCredentialRecovery({
 	authStorage,
 	modelRegistry,
 	discover = discoverCodexCredentials,
 	agentDir,
 	stateStore,
-}: AcceptedExternalCredentialRecoveryOptions): (provider: string) => Promise<boolean> {
+}: AcceptedExternalCredentialRecoveryOptions): (
+	provider: string,
+	selector?: AuthCredentialSelector,
+) => Promise<boolean> {
 	if (authStorage.isRemoteCredentialStore?.() === true) {
 		throw new Error("Codex OAuth recovery is supported only for local credential storage");
 	}
 	const store = stateStore ?? createCredentialAutoImportStateStore(agentDir);
-	const pendingProviders = new Map<string, PendingCredentialRecovery>();
+	const pendingRecoveries = new Map<string, PendingCredentialRecovery>();
 	const attemptedFingerprints = new Map<string, string>();
+	const activeRecoveryMutationTokens = new Set<symbol>();
+	const pendingCredentialDisableEvents = new Set<string>();
 	let epoch = 0;
 
-	authStorage.onGenerationChanged(() => {
+	authStorage.onGenerationChanged((_generation, event) => {
+		if (event?.kind === "credential-disabled" && event.provider === "openai-codex") {
+			const recoveryKey = event.recoveryKey ?? createCredentialRecoveryKey(event.provider);
+			pendingRecoveries.set(recoveryKey, { epoch, transientReadFailures: 0 });
+			pendingCredentialDisableEvents.add(recoveryKey);
+			return;
+		}
+		if (
+			event?.kind === "credential-import" &&
+			event.mutationToken !== undefined &&
+			activeRecoveryMutationTokens.has(event.mutationToken)
+		) {
+			return;
+		}
 		epoch += 1;
-		pendingProviders.clear();
+		pendingRecoveries.clear();
 	});
 	authStorage.onCredentialDisabled(event => {
 		if (isRecoverableCodexDisable(event)) {
-			pendingProviders.set(event.provider, { epoch, transientReadFailures: 0 });
+			const recoveryKey = event.recoveryKey ?? createCredentialRecoveryKey(event.provider);
+			if (pendingCredentialDisableEvents.delete(recoveryKey)) return;
+			pendingRecoveries.set(recoveryKey, { epoch, transientReadFailures: 0 });
 		}
 	});
 
-	return async provider => {
+	return async (provider, selector) => {
 		if (provider !== "openai-codex") return false;
-		const trigger = pendingProviders.get(provider);
+		const recoveryKey = createCredentialRecoveryKey(provider, selector);
+		const trigger = pendingRecoveries.get(recoveryKey);
 		if (!trigger || trigger.epoch !== epoch) return false;
 
-		const isTriggerCurrent = (): boolean => trigger.epoch === epoch && pendingProviders.get(provider) === trigger;
+		const isTriggerCurrent = (): boolean => trigger.epoch === epoch && pendingRecoveries.get(recoveryKey) === trigger;
 		const consumeTrigger = (): void => {
-			if (isTriggerCurrent()) pendingProviders.delete(provider);
+			if (isTriggerCurrent()) pendingRecoveries.delete(recoveryKey);
 		};
 		const preserveTransientFailure = (): void => {
 			if (!isTriggerCurrent()) return;
 			trigger.transientReadFailures += 1;
 			if (trigger.transientReadFailures >= MAX_TRANSIENT_RECOVERY_READ_FAILURES) {
-				pendingProviders.delete(provider);
+				pendingRecoveries.delete(recoveryKey);
 			}
 		};
 
@@ -597,7 +637,10 @@ export function createAcceptedExternalCredentialRecovery({
 			source: skip.source,
 			failureClass: classifyDiscoverySkip(skip.reason, skip.origin),
 		}));
-		const candidates = filterAutoImportOAuthCredentials(discovered.importable);
+		const discoveredCandidates = filterAutoImportOAuthCredentials(discovered.importable);
+		const candidates = selector
+			? discoveredCandidates.filter(candidate => matchesCredentialSelector(candidate, selector))
+			: discoveredCandidates;
 		if (candidates.length === 0) {
 			if (discoveryFailures.length > 0) {
 				logCredentialAutoImportFailures("oauth-recovery", discoveryFailures);
@@ -609,26 +652,31 @@ export function createAcceptedExternalCredentialRecovery({
 		}
 
 		const fingerprint = fingerprintOAuthCandidates(candidates);
-		if (!fingerprint || attemptedFingerprints.get(provider) === fingerprint) {
+		if (!fingerprint || attemptedFingerprints.get(recoveryKey) === fingerprint) {
 			consumeTrigger();
 			return false;
 		}
 		if (!isTriggerCurrent()) return false;
-		attemptedFingerprints.set(provider, fingerprint);
+		attemptedFingerprints.set(recoveryKey, fingerprint);
 		consumeTrigger();
 
 		let imported = false;
 		const importFailures: CredentialAutoImportFailure[] = [];
 		for (const candidate of candidates) {
 			if (epoch !== trigger.epoch) break;
+			const mutationToken = Symbol("credential-recovery-import");
+			activeRecoveryMutationTokens.add(mutationToken);
 			try {
 				const outcome = await authStorage.importCredentialIfAbsent(
 					candidate.provider,
 					candidate.credential as AuthCredential,
+					{ mutationToken },
 				);
 				if (outcome.inserted) imported = true;
 			} catch (error) {
 				importFailures.push({ credential: candidate, failureClass: classifyWriteFailure(error) });
+			} finally {
+				activeRecoveryMutationTokens.delete(mutationToken);
 			}
 		}
 		if (importFailures.length > 0) logCredentialAutoImportFailures("oauth-recovery", importFailures);

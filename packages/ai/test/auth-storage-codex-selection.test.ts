@@ -2,7 +2,15 @@ import { afterEach, beforeEach, describe, expect, test, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { type AuthCredentialStore, AuthStorage, SqliteAuthCredentialStore } from "../src/auth-storage";
+import {
+	type AuthCredentialStore,
+	AuthStorage,
+	type AuthStorageGenerationEvent,
+	type CredentialDisabledEvent,
+	createCredentialRecoveryKey,
+	SelectedCredentialUnavailableError,
+	SqliteAuthCredentialStore,
+} from "../src/auth-storage";
 import type { UsageLimit, UsageProvider, UsageReport } from "../src/usage";
 import * as oauthUtils from "../src/utils/oauth";
 import type { OAuthCredentials } from "../src/utils/oauth/types";
@@ -646,6 +654,56 @@ describe("AuthStorage codex oauth ranking", () => {
 		const apiKey = await authStorage.getApiKey("openai-codex", "session-pinned-codex-email");
 		expect(apiKey).toBe("api-acct-far");
 		expect(authStorage.getOAuthAccountId("openai-codex", "session-pinned-codex-email")).toBe("acct-far");
+	});
+
+	test("fails closed instead of returning another OAuth identity after the pinned credential is disabled", async () => {
+		if (!authStorage) throw new Error("test setup failed");
+
+		const selector = { kind: "email" as const, value: "pinned@example.com" };
+		const events: CredentialDisabledEvent[] = [];
+		authStorage.onCredentialDisabled(event => {
+			events.push(event);
+		});
+		vi.spyOn(oauthUtils, "refreshOAuthToken").mockRejectedValue(new Error("401 invalid_grant"));
+		await authStorage.set("openai-codex", [
+			{
+				type: "oauth",
+				...createCredential("acct-pinned", selector.value),
+				expires: Date.now() - HOUR_MS,
+			},
+			{ type: "oauth", ...createCredential("acct-other", "other@example.com") },
+		]);
+		const generationEvents: AuthStorageGenerationEvent[] = [];
+		authStorage.onGenerationChanged((_generation, event) => {
+			if (event) generationEvents.push(event);
+		});
+		authStorage.setRuntimeCredentialSelector("openai-codex", selector);
+
+		await expect(authStorage.getApiKey("openai-codex")).rejects.toBeInstanceOf(SelectedCredentialUnavailableError);
+		expect(generationEvents).toEqual([
+			{
+				kind: "credential-disabled",
+				provider: "openai-codex",
+				recoveryKey: createCredentialRecoveryKey("openai-codex", selector),
+			},
+		]);
+		expect(events).toEqual([
+			{
+				provider: "openai-codex",
+				disabledCause: expect.stringContaining("invalid_grant"),
+				recoveryKey: createCredentialRecoveryKey("openai-codex", selector),
+			},
+		]);
+
+		const error = await authStorage.getOAuthAccess("openai-codex").then(
+			() => undefined,
+			reason => reason,
+		);
+		expect(error).toBeInstanceOf(SelectedCredentialUnavailableError);
+		if (!(error instanceof SelectedCredentialUnavailableError)) {
+			throw new Error("Expected selected credential failure");
+		}
+		expect(error.selector).toEqual(selector);
 	});
 });
 

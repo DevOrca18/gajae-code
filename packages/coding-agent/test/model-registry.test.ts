@@ -2,7 +2,15 @@ import { afterEach, beforeEach, describe, expect, test, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { Effort, type Model, type OpenAICompat, type ThinkingConfig, writeModelCache } from "@gajae-code/ai";
+import {
+	type AuthCredentialSelector,
+	Effort,
+	type Model,
+	type OpenAICompat,
+	SelectedCredentialUnavailableError,
+	type ThinkingConfig,
+	writeModelCache,
+} from "@gajae-code/ai";
 import { kNoAuth, MODEL_ROLE_IDS, ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import {
 	type ModelLookupRegistry,
@@ -3540,6 +3548,87 @@ describe("ModelRegistry", () => {
 
 		expect(await Promise.all([first, second])).toEqual(["recovered-key", "recovered-key"]);
 		expect(recoveryCalls).toBe(1);
+	});
+
+	test("passes the typed selector to recovery and preserves the unavailable error when recovery fails", async () => {
+		const registry = new ModelRegistry(authStorage, modelsJsonPath);
+		const selector: AuthCredentialSelector = { kind: "email", value: "Pinned@Example.com" };
+		const unavailable = new SelectedCredentialUnavailableError("openai-codex", selector);
+		const lookup = vi.spyOn(authStorage, "getApiKey").mockRejectedValue(unavailable);
+		let recoveredSelector: AuthCredentialSelector | undefined;
+		registry.setCredentialRecovery(async (_provider, candidateSelector) => {
+			recoveredSelector = candidateSelector;
+			return false;
+		});
+
+		try {
+			await expect(
+				registry.getApiKeyForProvider("openai-codex", undefined, undefined, {
+					credentialSelector: selector,
+				}),
+			).rejects.toBe(unavailable);
+			expect(recoveredSelector).toEqual(selector);
+		} finally {
+			lookup.mockRestore();
+		}
+	});
+
+	test("does not share same-provider recovery across distinct pinned selectors", async () => {
+		const registry = new ModelRegistry(authStorage, modelsJsonPath);
+		const emailSelector: AuthCredentialSelector = { kind: "email", value: "first@example.com" };
+		const accountSelector: AuthCredentialSelector = { kind: "account", value: "account-second" };
+		const emailError = new SelectedCredentialUnavailableError("openai-codex", emailSelector);
+		const accountError = new SelectedCredentialUnavailableError("openai-codex", accountSelector);
+		const emailStarted = Promise.withResolvers<void>();
+		const accountStarted = Promise.withResolvers<void>();
+		const releaseEmail = Promise.withResolvers<void>();
+		const releaseAccount = Promise.withResolvers<void>();
+		const recoveredSelectors: AuthCredentialSelector[] = [];
+		let emailLookups = 0;
+		const lookup = vi.spyOn(authStorage, "getApiKey").mockImplementation(async (_provider, _sessionId, options) => {
+			if (options?.credentialSelector?.kind === "email") {
+				emailLookups += 1;
+				if (emailLookups > 1) return "email-recovered";
+				throw emailError;
+			}
+			throw accountError;
+		});
+		registry.setCredentialRecovery(async (_provider, selector) => {
+			if (!selector) return false;
+			recoveredSelectors.push(selector);
+			if (selector.kind === "email") {
+				emailStarted.resolve();
+				await releaseEmail.promise;
+			} else {
+				accountStarted.resolve();
+				await releaseAccount.promise;
+			}
+			return selector.kind === "email";
+		});
+
+		try {
+			const emailLookup = registry.getApiKeyForProvider("openai-codex", undefined, undefined, {
+				credentialSelector: emailSelector,
+			});
+			const accountLookup = registry.getApiKeyForProvider("openai-codex", undefined, undefined, {
+				credentialSelector: accountSelector,
+			});
+			const outcomes = Promise.allSettled([emailLookup, accountLookup]);
+
+			await Promise.all([emailStarted.promise, accountStarted.promise]);
+			expect(recoveredSelectors).toEqual([emailSelector, accountSelector]);
+			releaseEmail.resolve();
+			releaseAccount.resolve();
+
+			expect(await outcomes).toEqual([
+				{ status: "fulfilled", value: "email-recovered" },
+				{ status: "rejected", reason: accountError },
+			]);
+		} finally {
+			releaseEmail.resolve();
+			releaseAccount.resolve();
+			lookup.mockRestore();
+		}
 	});
 
 	test("does not invoke credential recovery when normal lookup succeeds", async () => {

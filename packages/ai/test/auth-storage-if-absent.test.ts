@@ -8,6 +8,7 @@ import {
 	type AuthCredentialIfAbsentResult,
 	type AuthCredentialStore,
 	AuthStorage,
+	type AuthStorageGenerationEvent,
 	type OAuthCredential,
 	REMOTE_REFRESH_SENTINEL,
 	SqliteAuthCredentialStore,
@@ -407,15 +408,35 @@ try {
 		const storage = await AuthStorage.create(path.join(tempDir, "generation.db"));
 		try {
 			expect(storage.isRemoteCredentialStore()).toBe(false);
-			await storage.importCredentialIfAbsent("anthropic", oauth("logout"));
 			const generations: number[] = [];
-			storage.onGenerationChanged(generation => generations.push(generation));
+			const events: AuthStorageGenerationEvent[] = [];
+			storage.onGenerationChanged((generation, event) => {
+				generations.push(generation);
+				if (event) events.push(event);
+			});
+			const mutationToken = Symbol("test-import");
+			await storage.importCredentialIfAbsent("anthropic", oauth("logout"), { mutationToken });
+			const importGeneration = storage.getGeneration();
 
 			await storage.logout("anthropic");
 			const firstLogoutGeneration = storage.getGeneration();
 			await storage.logout("anthropic");
 
-			expect(generations).toEqual([firstLogoutGeneration, storage.getGeneration()]);
+			expect(generations).toEqual([importGeneration, firstLogoutGeneration, storage.getGeneration()]);
+			expect(events).toEqual([
+				{
+					kind: "credential-import",
+					provider: "anthropic",
+					mutationToken,
+				},
+				{
+					kind: "mutation",
+					provider: "anthropic",
+				},
+				{
+					kind: "mutation",
+				},
+			]);
 			expect(storage.has("anthropic")).toBe(false);
 		} finally {
 			storage.close();
