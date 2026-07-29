@@ -349,7 +349,7 @@ export class CombinedAutocompleteProvider implements AutocompleteProvider {
 	// discovery continues to use native fuzzyFind + shared scan cache.
 	#dirCache: Map<string, { entries: fs.Dirent[]; timestamp: number }> = new Map();
 	#boundedDirCache: Map<string, { result: CachedBoundedDirResult; timestamp: number }> = new Map();
-	#boundedDirPending: Map<string, Promise<CachedBoundedDirResult>> = new Map();
+	#boundedDirPending: Map<string, Promise<CachedBoundedDirResult | null>> = new Map();
 	#boundedDirGeneration = 0;
 	#resolvedBasePathPromise: Promise<string> | null = null;
 	readonly #DIR_CACHE_TTL = 2000; // 2 seconds
@@ -921,29 +921,33 @@ export class CombinedAutocompleteProvider implements AutocompleteProvider {
 		}
 
 		const generation = this.#boundedDirGeneration;
-		let request: Promise<CachedBoundedDirResult>;
-		request = Promise.resolve(readDirLimited({ path: searchDir, limit }))
-			.then(result => ({
-				entries: Array.isArray(result.entries) ? result.entries : [],
-				truncated: result.truncated === true,
-			}))
-			.finally(() => {
+		let resolveRequest!: (result: CachedBoundedDirResult | null) => void;
+		const request = new Promise<CachedBoundedDirResult | null>(resolve => {
+			resolveRequest = resolve;
+		});
+		this.#boundedDirPending.set(key, request);
+
+		void Promise.resolve().then(async () => {
+			try {
+				const result = await Promise.resolve(readDirLimited({ path: searchDir, limit })).then(value => ({
+					entries: Array.isArray(value.entries) ? value.entries : [],
+					truncated: value.truncated === true,
+				}));
+				if (generation === this.#boundedDirGeneration) {
+					this.#boundedDirCache.set(key, { result, timestamp: Date.now() });
+					this.#pruneDirCache(this.#boundedDirCache);
+				}
+				resolveRequest(result);
+			} catch {
+				resolveRequest(null);
+			} finally {
 				if (this.#boundedDirPending.get(key) === request) {
 					this.#boundedDirPending.delete(key);
 				}
-			});
-		this.#boundedDirPending.set(key, request);
-
-		try {
-			const result = await request;
-			if (generation === this.#boundedDirGeneration) {
-				this.#boundedDirCache.set(key, { result, timestamp: Date.now() });
-				this.#pruneDirCache(this.#boundedDirCache);
 			}
-			return result;
-		} catch {
-			return null;
-		}
+		});
+
+		return request;
 	}
 
 	invalidateDirCache(dir?: string): void {
