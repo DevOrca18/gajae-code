@@ -18,6 +18,7 @@ import {
 	Process,
 	ProcessStatus,
 	PtySession,
+	readDirLimited,
 	summarizeCode,
 	truncateToWidth,
 	visibleWidth,
@@ -401,6 +402,35 @@ describe("pi-natives", () => {
 			}
 		});
 	});
+	describe("readDirLimited", () => {
+		it("caps real native enumeration without returning recursive children", async () => {
+			const scopedDir = await fs.mkdtemp(path.join(os.tmpdir(), "natives-read-dir-limited-"));
+			try {
+				await fs.writeFile(path.join(scopedDir, "alpha.ts"), "export const alpha = true;\n");
+				await fs.writeFile(path.join(scopedDir, "beta.ts"), "export const beta = true;\n");
+				await fs.mkdir(path.join(scopedDir, "nested"));
+				await fs.writeFile(path.join(scopedDir, "nested", "deep.ts"), "export const deep = true;\n");
+
+				const capped = await readDirLimited({ path: scopedDir, limit: 2 });
+				expect(capped.entries).toHaveLength(2);
+				expect(capped.truncated).toBe(true);
+
+				const complete = await readDirLimited({ path: scopedDir, limit: 10 });
+				expect(complete.truncated).toBe(false);
+				expect(complete.entries.map(entry => entry.name).sort()).toEqual(["alpha.ts", "beta.ts", "nested"]);
+				expect(complete.entries.find(entry => entry.name === "nested")?.isDirectory).toBe(true);
+				expect(complete.entries.some(entry => entry.name === "deep.ts")).toBe(false);
+			} finally {
+				await fs.rm(scopedDir, { recursive: true, force: true });
+			}
+		});
+
+		it("rejects a zero entry limit", async () => {
+			await expect(readDirLimited({ path: testDir, limit: 0 })).rejects.toThrow(
+				"readDirLimited requires `limit` to be greater than 0",
+			);
+		});
+	});
 	describe("fuzzyFind", () => {
 		it("should match abbreviated fuzzy queries across separators", async () => {
 			const result = await fuzzyFind({
@@ -412,6 +442,49 @@ describe("pi-natives", () => {
 			});
 
 			expect(result.matches.some(match => match.path === "history-search.ts")).toBe(true);
+		});
+
+		it("keeps cached symlink traversal within the requested root", async () => {
+			if (process.platform === "win32") return;
+
+			const root = await fs.mkdtemp(path.join(os.tmpdir(), "natives-fuzzy-boundary-"));
+			const outside = await fs.mkdtemp(path.join(os.tmpdir(), "natives-fuzzy-outside-"));
+			try {
+				const internalTarget = path.join(root, "internal-target", "nested");
+				await fs.mkdir(internalTarget, { recursive: true });
+				await fs.mkdir(path.join(outside, "nested"), { recursive: true });
+				await fs.writeFile(path.join(internalTarget, "inside-boundary-needle.ts"), "export {};\n");
+				await fs.writeFile(path.join(outside, "nested", "outside-boundary-needle.ts"), "export {};\n");
+				await fs.symlink(path.join(root, "internal-target"), path.join(root, "linked-inside"), "dir");
+				await fs.symlink(outside, path.join(root, "linked-outside"), "dir");
+
+				invalidateFsScanCache();
+				const unrestricted = await fuzzyFind({
+					query: "boundaryneedle",
+					path: root,
+					hidden: true,
+					gitignore: false,
+					cache: true,
+					maxResults: 100,
+				});
+				expect(unrestricted.matches.some(match => match.path.startsWith("linked-outside/"))).toBe(true);
+
+				const restricted = await fuzzyFind({
+					query: "boundaryneedle",
+					path: root,
+					hidden: true,
+					gitignore: false,
+					cache: true,
+					stayWithinRoot: true,
+					maxResults: 100,
+				});
+				expect(restricted.matches.some(match => match.path.startsWith("linked-inside/"))).toBe(true);
+				expect(restricted.matches.some(match => match.path.startsWith("linked-outside/"))).toBe(false);
+			} finally {
+				invalidateFsScanCache();
+				await fs.rm(root, { recursive: true, force: true });
+				await fs.rm(outside, { recursive: true, force: true });
+			}
 		});
 	});
 

@@ -1,6 +1,10 @@
 # Changelog
 
 ## [Unreleased]
+### Added
+
+- Added `readDirLimited`, a native single-directory helper that returns at most the requested direct children plus a `truncated` flag without recursing or following symlinks during enumeration.
+- Added an opt-in `fuzzyFind({ stayWithinRoot: true })` discovery policy that prunes symlinks whose canonical targets are outside the search root.
 
 ## [0.12.0] - 2026-07-28
 ### Fixed

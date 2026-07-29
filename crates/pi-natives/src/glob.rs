@@ -174,6 +174,7 @@ fn run_glob(
 		use_gitignore: config.use_gitignore,
 		skip_node_modules,
 		follow_links: false,
+		stay_within_root: false,
 		detail: if config.sort_by_mtime {
 			fs_cache::ScanDetail::Full
 		} else {

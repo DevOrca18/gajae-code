@@ -921,6 +921,12 @@ export interface FuzzyFindOptions {
   gitignore?: boolean
   /** Enable shared filesystem scan cache (default: false). */
   cache?: boolean
+  /**
+   * Best-effort discovery containment that follows symlinks only when their
+   * canonical target remains under the search root (default: false). This is
+   * not a security boundary against concurrent filesystem mutation.
+   */
+  stayWithinRoot?: boolean
   /** Maximum number of matches to return (default: 100). */
   maxResults?: number
   /** Abort signal for cancelling the operation. */
@@ -1965,6 +1971,35 @@ export interface PtyStartOptions {
 }
 
 export declare function ptyTimeoutCount(): bigint
+
+/** Read at most `limit` direct children from one directory without recursion. */
+export declare function readDirLimited(options: ReadDirLimitedOptions): Promise<ReadDirLimitedResult>
+
+/** A single filesystem entry returned by `readDirLimited`. */
+export interface ReadDirLimitedEntry {
+  /** Basename only; no path separators or parent path included. */
+  name: string
+  /** Whether this entry itself is a directory. */
+  isDirectory: boolean
+  /** Whether this entry itself is a symbolic link. */
+  isSymbolicLink: boolean
+}
+
+/** Options for bounded single-directory enumeration. */
+export interface ReadDirLimitedOptions {
+  /** Directory to enumerate. */
+  path: string
+  /** Maximum number of entries to return. Must be positive. */
+  limit: number
+}
+
+/** Bounded single-directory enumeration result. */
+export interface ReadDirLimitedResult {
+  /** Entries observed before truncation, capped at `limit`. */
+  entries: Array<ReadDirLimitedEntry>
+  /** Whether more direct children existed beyond `entries`. */
+  truncated: boolean
+}
 
 /**
  * Read an image from the system clipboard.

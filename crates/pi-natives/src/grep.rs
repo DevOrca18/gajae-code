@@ -1714,6 +1714,7 @@ fn grep_sync(
 		use_gitignore,
 		skip_node_modules: !mentions_node_modules,
 		follow_links: false,
+		stay_within_root: false,
 		detail: fs_cache::ScanDetail::Minimal,
 	};
 	let entries = if use_cache {

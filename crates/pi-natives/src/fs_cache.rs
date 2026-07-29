@@ -99,6 +99,8 @@ struct CacheKey {
 	include_hidden:    bool,
 	use_gitignore:     bool,
 	skip_node_modules: bool,
+	follow_links:      bool,
+	stay_within_root:  bool,
 	detail:            ScanDetail,
 }
 
@@ -114,6 +116,7 @@ pub struct ScanOptions {
 	pub use_gitignore:     bool,
 	pub skip_node_modules: bool,
 	pub follow_links:      bool,
+	pub stay_within_root:  bool,
 	pub detail:            ScanDetail,
 }
 
@@ -293,6 +296,7 @@ pub fn build_walker(
 
 struct EntryVisitor<'a> {
 	root:           &'a Path,
+	canonical_root: Option<&'a Path>,
 	detail:         ScanDetail,
 	ct:             &'a task::CancelToken,
 	entries:        Vec<GlobMatch>,
@@ -329,15 +333,25 @@ impl ParallelVisitor for EntryVisitor<'_> {
 		let Ok(entry) = entry else {
 			return WalkState::Continue;
 		};
+		let skip_external_symlink = self.canonical_root.is_some_and(|canonical_root| {
+			entry.path_is_symlink()
+				&& !std::fs::canonicalize(entry.path())
+					.is_ok_and(|target| target.starts_with(canonical_root))
+		});
 		if let Some(entry) = collect_entry(self.root, &entry, self.detail) {
 			self.entries.push(entry);
 		}
-		WalkState::Continue
+		if skip_external_symlink {
+			WalkState::Skip
+		} else {
+			WalkState::Continue
+		}
 	}
 }
 
 struct EntryVisitorBuilder<'a> {
 	root:           &'a Path,
+	canonical_root: Option<&'a Path>,
 	detail:         ScanDetail,
 	ct:             &'a task::CancelToken,
 	shared_entries: Arc<Mutex<Vec<Vec<GlobMatch>>>>,
@@ -348,6 +362,7 @@ impl<'a> ParallelVisitorBuilder<'a> for EntryVisitorBuilder<'a> {
 	fn build(&mut self) -> Box<dyn ParallelVisitor + 'a> {
 		Box::new(EntryVisitor {
 			root:           self.root,
+			canonical_root: self.canonical_root,
 			detail:         self.detail,
 			ct:             self.ct,
 			entries:        Vec::new(),
@@ -378,8 +393,12 @@ fn collect_entries(
 	}
 	let shared_entries = Arc::new(Mutex::new(Vec::new()));
 	let error = Arc::new(Mutex::new(None));
+	let canonical_root = options
+		.stay_within_root
+		.then(|| std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf()));
 	let mut visitor_builder = EntryVisitorBuilder {
 		root,
+		canonical_root: canonical_root.as_deref(),
 		detail: options.detail,
 		ct,
 		shared_entries: Arc::clone(&shared_entries),
@@ -461,6 +480,8 @@ pub fn get_or_scan(
 		include_hidden:    options.include_hidden,
 		use_gitignore:     options.use_gitignore,
 		skip_node_modules: options.skip_node_modules,
+		follow_links:      options.follow_links,
+		stay_within_root:  options.stay_within_root,
 		detail:            options.detail,
 	};
 
@@ -499,6 +520,8 @@ pub fn force_rescan(
 		include_hidden:    options.include_hidden,
 		use_gitignore:     options.use_gitignore,
 		skip_node_modules: options.skip_node_modules,
+		follow_links:      options.follow_links,
+		stay_within_root:  options.stay_within_root,
 		detail:            options.detail,
 	};
 	FS_CACHE.remove(&key);
@@ -701,6 +724,7 @@ mod tests {
 				use_gitignore:     false,
 				skip_node_modules: true,
 				follow_links:      false,
+				stay_within_root:  false,
 				detail:            super::ScanDetail::Full,
 			},
 			&ct,
@@ -728,6 +752,7 @@ mod tests {
 				use_gitignore:     false,
 				skip_node_modules: true,
 				follow_links:      false,
+				stay_within_root:  false,
 				detail:            super::ScanDetail::Minimal,
 			},
 			&ct,
@@ -763,6 +788,7 @@ mod tests {
 				use_gitignore:     false,
 				skip_node_modules: true,
 				follow_links:      false,
+				stay_within_root:  false,
 				detail:            super::ScanDetail::Full,
 			},
 			false,
@@ -780,6 +806,7 @@ mod tests {
 				use_gitignore:     false,
 				skip_node_modules: false,
 				follow_links:      false,
+				stay_within_root:  false,
 				detail:            super::ScanDetail::Full,
 			},
 			false,
@@ -802,6 +829,7 @@ mod tests {
 				use_gitignore:     false,
 				skip_node_modules: true,
 				follow_links:      false,
+				stay_within_root:  false,
 				detail:            super::ScanDetail::Minimal,
 			},
 			&ct,
@@ -821,6 +849,7 @@ mod tests {
 				use_gitignore:     false,
 				skip_node_modules: true,
 				follow_links:      false,
+				stay_within_root:  false,
 				detail:            super::ScanDetail::Full,
 			},
 			&ct,

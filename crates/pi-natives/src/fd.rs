@@ -1,34 +1,138 @@
-//! Fuzzy file path discovery for autocomplete and @-mention resolution.
+//! Directory primitives plus fuzzy file path discovery for autocomplete and
+//! @-mention resolution.
 //!
-//! Searches for files and directories whose paths match a query string via
-//! subsequence scoring. Uses the shared [`fs_cache`] for directory scanning.
+//! `readDirLimited` provides bounded single-directory enumeration without
+//! recursion, while `fuzzyFind` searches for files and directories whose paths
+//! match a query string via subsequence scoring using the shared [`fs_cache`].
 
-use std::path::Path;
+use std::{fs, path::Path};
 
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 
 use crate::{fs_cache, task};
 
+/// Options for bounded single-directory enumeration.
+#[derive(Debug)]
+#[napi(object)]
+pub struct ReadDirLimitedOptions {
+	/// Directory to enumerate.
+	pub path:  String,
+	/// Maximum number of entries to return. Must be positive.
+	pub limit: u32,
+}
+
+/// A single filesystem entry returned by `readDirLimited`.
+#[derive(Debug)]
+#[napi(object)]
+pub struct ReadDirLimitedEntry {
+	/// Basename only; no path separators or parent path included.
+	pub name:             String,
+	/// Whether this entry itself is a directory.
+	pub is_directory:     bool,
+	/// Whether this entry itself is a symbolic link.
+	pub is_symbolic_link: bool,
+}
+
+/// Bounded single-directory enumeration result.
+#[derive(Debug)]
+#[napi(object)]
+pub struct ReadDirLimitedResult {
+	/// Entries observed before truncation, capped at `limit`.
+	pub entries:   Vec<ReadDirLimitedEntry>,
+	/// Whether more direct children existed beyond `entries`.
+	pub truncated: bool,
+}
+
+fn invalid_limit_error() -> Error {
+	Error::from_reason("readDirLimited requires `limit` to be greater than 0".to_string())
+}
+
+fn io_error(err: std::io::Error, context: &str) -> Error {
+	Error::from_reason(format!("{context}: {err}"))
+}
+
+fn consume_limited_results<I, T, E>(
+	mut iter: I,
+	limit: usize,
+) -> std::result::Result<(Vec<T>, bool), E>
+where
+	I: Iterator<Item = std::result::Result<T, E>>,
+{
+	let mut entries = Vec::new();
+	while entries.len() < limit {
+		match iter.next() {
+			Some(Ok(entry)) => entries.push(entry),
+			Some(Err(err)) => return Err(err),
+			None => return Ok((entries, false)),
+		}
+	}
+
+	match iter.next() {
+		Some(Ok(_)) => Ok((entries, true)),
+		Some(Err(err)) => Err(err),
+		None => Ok((entries, false)),
+	}
+}
+
+fn read_dir_limited_sync(options: ReadDirLimitedOptions) -> Result<ReadDirLimitedResult> {
+	let limit = usize::try_from(options.limit).map_err(|_| invalid_limit_error())?;
+	if limit == 0 {
+		return Err(invalid_limit_error());
+	}
+
+	let direct_entries = fs::read_dir(&options.path)
+		.map_err(|err| io_error(err, "Failed to read directory"))?
+		.map(|entry| -> Result<ReadDirLimitedEntry> {
+			let entry = entry.map_err(|err| io_error(err, "Failed to read directory entry"))?;
+			let file_type = entry
+				.file_type()
+				.map_err(|err| io_error(err, "Failed to inspect directory entry type"))?;
+			let name = entry.file_name().into_string().map_err(|name| {
+				Error::from_reason(format!("Directory entry name is not valid UTF-8: {:?}", name))
+			})?;
+			Ok(ReadDirLimitedEntry {
+				name,
+				is_directory: file_type.is_dir(),
+				is_symbolic_link: file_type.is_symlink(),
+			})
+		});
+
+	let (entries, truncated) = consume_limited_results(direct_entries, limit)?;
+	Ok(ReadDirLimitedResult { entries, truncated })
+}
+
+/// Read at most `limit` direct children from one directory without recursion.
+#[napi(js_name = "readDirLimited")]
+pub fn read_dir_limited(options: ReadDirLimitedOptions) -> task::Promise<ReadDirLimitedResult> {
+	task::blocking("readDirLimited", task::CancelToken::default(), move |_| {
+		read_dir_limited_sync(options)
+	})
+}
+
 /// Options for fuzzy file path search.
 #[napi(object)]
 pub struct FuzzyFindOptions<'env> {
 	/// Fuzzy query to match against file paths (case-insensitive).
-	pub query:       String,
+	pub query:            String,
 	/// Directory to search.
-	pub path:        String,
+	pub path:             String,
 	/// Include hidden files (default: false).
-	pub hidden:      Option<bool>,
+	pub hidden:           Option<bool>,
 	/// Respect .gitignore (default: true).
-	pub gitignore:   Option<bool>,
+	pub gitignore:        Option<bool>,
 	/// Enable shared filesystem scan cache (default: false).
-	pub cache:       Option<bool>,
+	pub cache:            Option<bool>,
+	/// Best-effort discovery containment that follows symlinks only when their
+	/// canonical target remains under the search root (default: false). This is
+	/// not a security boundary against concurrent filesystem mutation.
+	pub stay_within_root: Option<bool>,
 	/// Maximum number of matches to return (default: 100).
-	pub max_results: Option<u32>,
+	pub max_results:      Option<u32>,
 	/// Abort signal for cancelling the operation.
-	pub signal:      Option<Unknown<'env>>,
+	pub signal:           Option<Unknown<'env>>,
 	/// Timeout in milliseconds for the operation.
-	pub timeout_ms:  Option<u32>,
+	pub timeout_ms:       Option<u32>,
 }
 
 /// A single match in fuzzy find results.
@@ -152,12 +256,13 @@ fn score_fuzzy_path(
 }
 
 struct FuzzyFindConfig {
-	query:       String,
-	path:        String,
-	hidden:      Option<bool>,
-	gitignore:   Option<bool>,
-	max_results: Option<u32>,
-	cache:       Option<bool>,
+	query:            String,
+	path:             String,
+	hidden:           Option<bool>,
+	gitignore:        Option<bool>,
+	max_results:      Option<u32>,
+	cache:            Option<bool>,
+	stay_within_root: Option<bool>,
 }
 
 fn score_entries(
@@ -212,6 +317,7 @@ fn fuzzy_find_sync(config: FuzzyFindConfig, ct: task::CancelToken) -> Result<Fuz
 		use_gitignore: respect_gitignore,
 		skip_node_modules: true,
 		follow_links: true,
+		stay_within_root: config.stay_within_root.unwrap_or(false),
 		detail: fs_cache::ScanDetail::Minimal,
 	};
 	let mut scored = if use_cache {
@@ -240,9 +346,261 @@ fn fuzzy_find_sync(config: FuzzyFindConfig, ct: task::CancelToken) -> Result<Fuz
 /// Fuzzy file path search for autocomplete.
 #[napi(js_name = "fuzzyFind")]
 pub fn fuzzy_find(options: FuzzyFindOptions<'_>) -> task::Promise<FuzzyFindResult> {
-	let FuzzyFindOptions { query, path, hidden, gitignore, cache, max_results, timeout_ms, signal } =
-		options;
+	let FuzzyFindOptions {
+		query,
+		path,
+		hidden,
+		gitignore,
+		cache,
+		stay_within_root,
+		max_results,
+		timeout_ms,
+		signal,
+	} = options;
 	let ct = task::CancelToken::new(timeout_ms, signal);
-	let config = FuzzyFindConfig { query, path, hidden, gitignore, max_results, cache };
+	let config =
+		FuzzyFindConfig { query, path, hidden, gitignore, max_results, cache, stay_within_root };
 	task::blocking("fuzzy_find", ct, move |ct| fuzzy_find_sync(config, ct))
+}
+
+#[cfg(test)]
+mod tests {
+	use std::{
+		cell::Cell,
+		collections::BTreeMap,
+		fs,
+		path::{Path, PathBuf},
+		rc::Rc,
+		sync::atomic::{AtomicU64, Ordering},
+		time::{SystemTime, UNIX_EPOCH},
+	};
+
+	use super::{ReadDirLimitedOptions, consume_limited_results, read_dir_limited_sync};
+
+	struct TempDir {
+		path: PathBuf,
+	}
+
+	impl TempDir {
+		fn new(prefix: &str) -> Self {
+			static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+			let unique = SystemTime::now()
+				.duration_since(UNIX_EPOCH)
+				.expect("system clock before unix epoch")
+				.as_nanos();
+			let suffix = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+			let path = std::env::temp_dir().join(format!("{prefix}-{unique}-{suffix}"));
+			fs::create_dir_all(&path).expect("create temp directory");
+			Self { path }
+		}
+
+		fn path(&self) -> &Path {
+			&self.path
+		}
+	}
+
+	impl Drop for TempDir {
+		fn drop(&mut self) {
+			let _ = fs::remove_dir_all(&self.path);
+		}
+	}
+
+	fn read_dir_names(root: &Path, limit: u32) -> super::ReadDirLimitedResult {
+		read_dir_limited_sync(ReadDirLimitedOptions {
+			path: root.to_string_lossy().into_owned(),
+			limit,
+		})
+		.expect("readDirLimited should succeed")
+	}
+
+	fn create_symlink(target: &Path, link: &Path) -> Option<()> {
+		#[cfg(unix)]
+		{
+			std::os::unix::fs::symlink(target, link).expect("create unix symlink");
+			Some(())
+		}
+		#[cfg(windows)]
+		{
+			let result = if target.is_dir() {
+				std::os::windows::fs::symlink_dir(target, link)
+			} else {
+				std::os::windows::fs::symlink_file(target, link)
+			};
+			match result {
+				Ok(()) => Some(()),
+				Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => None,
+				Err(err) => panic!("create windows symlink: {err}"),
+			}
+		}
+	}
+
+	#[test]
+	fn rejects_zero_limit() {
+		let root = TempDir::new("pi-read-dir-limited");
+		let err = read_dir_limited_sync(ReadDirLimitedOptions {
+			path:  root.path().to_string_lossy().into_owned(),
+			limit: 0,
+		})
+		.expect_err("limit=0 should be rejected");
+
+		assert!(err.to_string().contains("limit"));
+	}
+
+	#[test]
+	fn returns_empty_result_for_empty_directory() {
+		let root = TempDir::new("pi-read-dir-limited");
+		let result = read_dir_names(root.path(), 4);
+		assert!(result.entries.is_empty());
+		assert!(!result.truncated);
+	}
+
+	#[test]
+	fn returns_all_entries_when_fewer_than_limit() {
+		let root = TempDir::new("pi-read-dir-limited");
+		fs::write(root.path().join("alpha.txt"), "alpha").expect("write alpha");
+		fs::write(root.path().join("beta.txt"), "beta").expect("write beta");
+
+		let result = read_dir_names(root.path(), 4);
+		let truncated = result.truncated;
+		let names: Vec<_> = result.entries.into_iter().map(|entry| entry.name).collect();
+		assert_eq!(names.len(), 2);
+		assert!(names.contains(&"alpha.txt".to_string()));
+		assert!(names.contains(&"beta.txt".to_string()));
+		assert!(!truncated);
+	}
+
+	#[test]
+	fn returns_exact_limit_without_truncation() {
+		let root = TempDir::new("pi-read-dir-limited");
+		for name in ["alpha.txt", "beta.txt", "gamma.txt"] {
+			fs::write(root.path().join(name), name).expect("write fixture file");
+		}
+
+		let result = read_dir_names(root.path(), 3);
+		assert_eq!(result.entries.len(), 3);
+		assert!(!result.truncated);
+	}
+
+	#[test]
+	fn truncates_after_limit_entries() {
+		let root = TempDir::new("pi-read-dir-limited");
+		for name in ["alpha.txt", "beta.txt", "gamma.txt"] {
+			fs::write(root.path().join(name), name).expect("write fixture file");
+		}
+
+		let result = read_dir_names(root.path(), 2);
+		assert_eq!(result.entries.len(), 2);
+		assert!(result.truncated);
+	}
+
+	#[test]
+	fn classifies_files_directories_and_symlinks() {
+		let root = TempDir::new("pi-read-dir-limited");
+		let regular = root.path().join("regular.txt");
+		let directory = root.path().join("nested");
+		let symlink = root.path().join("regular-link");
+		fs::write(&regular, "alpha").expect("write regular file");
+		fs::create_dir(&directory).expect("create nested directory");
+		if create_symlink(&regular, &symlink).is_none() {
+			return;
+		}
+
+		let result = read_dir_names(root.path(), 8);
+		let entries = result
+			.entries
+			.into_iter()
+			.map(|entry| (entry.name.clone(), entry))
+			.collect::<BTreeMap<_, _>>();
+
+		assert_eq!(entries["regular.txt"].is_directory, false);
+		assert_eq!(entries["regular.txt"].is_symbolic_link, false);
+		assert_eq!(entries["nested"].is_directory, true);
+		assert_eq!(entries["nested"].is_symbolic_link, false);
+		assert_eq!(entries["regular-link"].is_directory, false);
+		assert_eq!(entries["regular-link"].is_symbolic_link, true);
+	}
+
+	#[test]
+	fn returns_errors_for_missing_or_non_directory_paths() {
+		let root = TempDir::new("pi-read-dir-limited");
+		let missing = root.path().join("missing");
+		let file = root.path().join("plain.txt");
+		fs::write(&file, "plain").expect("write plain file");
+
+		let missing_error = read_dir_limited_sync(ReadDirLimitedOptions {
+			path:  missing.to_string_lossy().into_owned(),
+			limit: 1,
+		})
+		.expect_err("missing path should fail");
+		assert!(
+			missing_error
+				.to_string()
+				.contains("Failed to read directory")
+		);
+
+		let file_error = read_dir_limited_sync(ReadDirLimitedOptions {
+			path:  file.to_string_lossy().into_owned(),
+			limit: 1,
+		})
+		.expect_err("file path should fail");
+		assert!(file_error.to_string().contains("Failed to read directory"));
+	}
+
+	#[test]
+	fn never_returns_recursive_children() {
+		let root = TempDir::new("pi-read-dir-limited");
+		let nested = root.path().join("nested");
+		fs::create_dir(&nested).expect("create nested directory");
+		fs::write(nested.join("child.txt"), "child").expect("write nested child");
+
+		let result = read_dir_names(root.path(), 8);
+		let names: Vec<_> = result.entries.into_iter().map(|entry| entry.name).collect();
+		assert_eq!(names, vec!["nested".to_string()]);
+	}
+
+	#[test]
+	fn repeated_calls_do_not_hold_directory_handles() {
+		let root = TempDir::new("pi-read-dir-limited");
+		fs::write(root.path().join("alpha.txt"), "alpha").expect("write alpha");
+
+		for _ in 0..32 {
+			let result = read_dir_names(root.path(), 1);
+			assert_eq!(result.entries.len(), 1);
+		}
+
+		fs::remove_file(root.path().join("alpha.txt")).expect("remove file after repeated reads");
+	}
+
+	struct CountingIterator {
+		next_value: usize,
+		total:      usize,
+		observed:   Rc<Cell<usize>>,
+	}
+
+	impl Iterator for CountingIterator {
+		type Item = std::result::Result<usize, &'static str>;
+
+		fn next(&mut self) -> Option<Self::Item> {
+			if self.next_value >= self.total {
+				return None;
+			}
+			let current = self.next_value;
+			self.next_value += 1;
+			self.observed.set(self.observed.get() + 1);
+			Some(Ok(current))
+		}
+	}
+
+	#[test]
+	fn iterator_core_observes_at_most_limit_plus_one_entries() {
+		let observed = Rc::new(Cell::new(0));
+		let iterator =
+			CountingIterator { next_value: 0, total: 50, observed: observed.clone() };
+		let (values, truncated) =
+			consume_limited_results(iterator, 3).expect("iterator core should succeed");
+
+		assert_eq!(values, vec![0, 1, 2]);
+		assert!(truncated);
+		assert_eq!(observed.get(), 4);
+	}
 }
