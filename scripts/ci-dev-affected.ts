@@ -430,16 +430,16 @@ export function needsWindowsSessionPathRegression(paths: readonly string[]): boo
 }
 
 // Paths that need an exact-head Windows addon build plus live temp-dir/junction
-// autocomplete proof. The hosted Windows runner is the only place we can verify
-// drive-letter, home-backslash, and junction behavior against a real win32 addon.
+// autocomplete proof. Route by owning source/binding directories rather than a
+// stale exact-file allowlist so moved helpers and generated loader surfaces do
+// not silently bypass the required Windows job.
 export function isWindowsAutocompletePathRegressionPath(changedPath: string): boolean {
-	return changedPath === "packages/tui/src/autocomplete.ts" ||
-		changedPath === "packages/tui/test/autocomplete.test.ts" ||
-		changedPath === "packages/tui/test/autocomplete.windows.test.ts" ||
-		changedPath === "crates/pi-natives/src/fd.rs" ||
-		changedPath === "crates/pi-natives/src/fs_cache.rs" ||
-		changedPath === "packages/natives/native/index.d.ts" ||
-		changedPath === "packages/natives/native/index.js";
+	return changedPath.startsWith("packages/tui/src/") ||
+		changedPath.startsWith("packages/tui/test/") ||
+		changedPath.startsWith("crates/pi-natives/src/") ||
+		changedPath.startsWith("packages/natives/native/") ||
+		changedPath.startsWith("packages/natives/scripts/") ||
+		changedPath.startsWith("packages/natives/test/");
 }
 
 export function needsWindowsAutocompletePathRegression(paths: readonly string[]): boolean {

@@ -760,24 +760,16 @@ export class CombinedAutocompleteProvider implements AutocompleteProvider {
 
 		try {
 			if (!(await fs.promises.stat(baseDir)).isDirectory()) {
-				return {
-					baseDir,
-					query,
-					displayBase,
-					useBoundedEnumeration: true,
-				};
+				return null;
 			}
 		} catch {
-			return {
-				baseDir,
-				query,
-				displayBase,
-				useBoundedEnumeration: true,
-			};
+			return null;
 		}
 
+		const resolvedBaseDir =
+			literalRelativeBaseDir !== null ? await this.#resolveEnumerationDir(literalRelativeBaseDir) : baseDir;
 		return {
-			baseDir,
+			baseDir: resolvedBaseDir,
 			query,
 			displayBase,
 			useBoundedEnumeration: isCanonicalOutsideProject,
@@ -1004,6 +996,9 @@ export class CombinedAutocompleteProvider implements AutocompleteProvider {
 		let scopedQuery: ScopedFuzzyQuery | null = null;
 		if (rawPrefix.length > 0 && !usesImmediateBoundedEnumeration) {
 			scopedQuery = await this.#resolveScopedFuzzyQuery(rawPrefix);
+		}
+		if (scopedQuery === null && this.#hasParentPathSegment(rawPrefix)) {
+			return [];
 		}
 
 		const usesBoundedEnumeration = usesImmediateBoundedEnumeration || scopedQuery?.useBoundedEnumeration === true;

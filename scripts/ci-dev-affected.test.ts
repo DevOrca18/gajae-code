@@ -1112,17 +1112,19 @@ test("tab-worker graph changes always include install-methods and are Darwin rel
 	test("routes native and TUI autocomplete paths to the Windows regression", () => {
 		for (const changedPath of [
 			"packages/tui/src/autocomplete.ts",
+			"packages/tui/src/components/editor.ts",
 			"packages/tui/test/autocomplete.test.ts",
 			"packages/tui/test/autocomplete.windows.test.ts",
 			"crates/pi-natives/src/fd.rs",
 			"crates/pi-natives/src/fs_cache.rs",
 			"packages/natives/native/index.d.ts",
-			"packages/natives/native/index.js",
+			"packages/natives/native/loader-state.js",
+			"packages/natives/scripts/embed-native.ts",
 		]) {
 			expect(isWindowsAutocompletePathRegressionPath(changedPath)).toBe(true);
 			expect(needsWindowsAutocompletePathRegression([changedPath])).toBe(true);
 		}
-		expect(isWindowsAutocompletePathRegressionPath("packages/tui/src/components/editor.ts")).toBe(false);
+		expect(isWindowsAutocompletePathRegressionPath("packages/tui/package.json")).toBe(false);
 		expect(needsWindowsAutocompletePathRegression(["packages/coding-agent/src/edit/foo.ts"])).toBe(false);
 	});
 
