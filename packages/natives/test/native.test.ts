@@ -460,6 +460,32 @@ describe("pi-natives", () => {
 				);
 			}
 		});
+
+		it.skipIf(process.platform !== "linux")(
+			"exposes the fixed path-free UTF-8 error through the N-API boundary",
+			async () => {
+				const scopedDir = await fs.mkdtemp(path.join(os.tmpdir(), "natives-read-dir-non-utf8-"));
+				try {
+					const invalidPath = Buffer.concat([
+						Buffer.from(`${scopedDir}${path.sep}`),
+						Buffer.from([0xff, 0x2e, 0x74, 0x73]),
+					]);
+					await fs.writeFile(invalidPath, "");
+
+					let rejection: unknown;
+					try {
+						await readDirLimited({ path: scopedDir, limit: 1 });
+					} catch (error) {
+						rejection = error;
+					}
+
+					expect(rejection).toBeInstanceOf(Error);
+					expect((rejection as Error).message).toBe("Directory entry name is not valid UTF-8");
+				} finally {
+					await fs.rm(scopedDir, { recursive: true, force: true });
+				}
+			},
+		);
 	});
 	describe("fuzzyFind", () => {
 		it("should match abbreviated fuzzy queries across separators", async () => {
