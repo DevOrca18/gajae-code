@@ -12,6 +12,8 @@ use napi_derive::napi;
 
 use crate::{fs_cache, task};
 
+const INVALID_UTF8_ENTRY_REASON: &str = "Directory entry name is not valid UTF-8";
+
 /// Options for bounded single-directory enumeration.
 #[derive(Debug)]
 #[napi(object)]
@@ -97,7 +99,7 @@ fn read_dir_limited_sync(options: ReadDirLimitedOptions) -> Result<ReadDirLimite
 		let name = entry
 			.file_name()
 			.into_string()
-			.map_err(|_| Error::from_reason("Directory entry name is not valid UTF-8".to_string()))?;
+			.map_err(|_| Error::from_reason(INVALID_UTF8_ENTRY_REASON.to_string()))?;
 		Ok(ReadDirLimitedEntry {
 			name,
 			is_directory: file_type.is_dir(),
@@ -700,6 +702,6 @@ mod tests {
 		})
 		.expect_err("invalid utf8 entry should fail");
 
-		assert_eq!(err.to_string(), "Directory entry name is not valid UTF-8");
+		assert_eq!(err.reason, INVALID_UTF8_ENTRY_REASON);
 	}
 }
