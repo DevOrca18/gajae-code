@@ -97,12 +97,16 @@ describe.skipIf(!isWindows)("CombinedAutocompleteProvider Windows path regressio
 	});
 
 	it("preserves the typed backslash form for recursive project-relative directory completions", async () => {
-		fs.mkdirSync(path.join(baseDir, "src", "Documents"), { recursive: true });
-		const line = "@src\\Doc";
+		fs.mkdirSync(path.join(baseDir, "src", "nested", "Documents"), { recursive: true });
+		fs.writeFileSync(path.join(baseDir, "src", "nested", "deeper.ts"), "export const deeper = true;\n");
 
-		const result = await provider.getSuggestions([line], 0, line.length);
+		const directoryLine = "@src\\Doc";
+		const directoryResult = await provider.getSuggestions([directoryLine], 0, directoryLine.length);
+		const fileLine = "@src\\deep";
+		const fileResult = await provider.getSuggestions([fileLine], 0, fileLine.length);
 
-		expect(result?.items.map(item => item.value)).toContain("@src\\Documents\\");
+		expect(directoryResult?.items.map(item => item.value)).toContain("@src\\nested\\Documents\\");
+		expect(fileResult?.items.map(item => item.value)).toContain("@src\\nested\\deeper.ts");
 	});
 
 	it("limits junction suggestions to direct entries", async () => {
@@ -158,6 +162,9 @@ describe.skipIf(!isWindows)("CombinedAutocompleteProvider Windows path regressio
 		const values = result?.items.map(item => item.value) ?? [];
 		expect(values).toContain("@linked-inside/nested/inside-boundary-needle.ts");
 		expect(values).not.toContain("@linked-outside/nested/outside-boundary-needle.ts");
+		const outsideRootLine = "@linkedoutside";
+		const outsideRootResult = await provider.getSuggestions([outsideRootLine], 0, outsideRootLine.length);
+		expect(outsideRootResult?.items.map(item => item.value) ?? []).not.toContain("@linked-outside/");
 	});
 
 	it("completes UNC prefixes from the built native addon when a live UNC root is provided", async () => {

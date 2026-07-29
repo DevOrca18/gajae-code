@@ -350,6 +350,7 @@ export class CombinedAutocompleteProvider implements AutocompleteProvider {
 	#dirCache: Map<string, { entries: fs.Dirent[]; timestamp: number }> = new Map();
 	#boundedDirCache: Map<string, { result: CachedBoundedDirResult; timestamp: number }> = new Map();
 	#boundedDirPending: Map<string, Promise<CachedBoundedDirResult | null>> = new Map();
+	#scopedPathAdmissions: Map<string, number> = new Map();
 	#boundedDirGeneration = 0;
 	#resolvedBasePathPromise: Promise<string> | null = null;
 	readonly #DIR_CACHE_TTL = 2000; // 2 seconds
@@ -436,32 +437,56 @@ export class CombinedAutocompleteProvider implements AutocompleteProvider {
 		if (atPrefix) {
 			const { rawPrefix, isQuotedPrefix } = parsePathPrefix(atPrefix);
 			const usesImmediateBoundedPathCompletion = this.#isImmediatelyUnsafeAutomaticPrefix(rawPrefix);
-			let scopedQuery: ScopedFuzzyQuery | null = null;
-			if (rawPrefix.length > 0 && !usesImmediateBoundedPathCompletion) {
-				scopedQuery = await this.#resolveScopedFuzzyQuery(rawPrefix);
+			const releaseAdmission = this.#tryAcquireScopedPathAdmission(rawPrefix, usesImmediateBoundedPathCompletion);
+			if (releaseAdmission === null) {
+				return null;
 			}
-			const usesBoundedPathCompletion =
-				usesImmediateBoundedPathCompletion || scopedQuery?.useBoundedEnumeration === true;
-			const suggestions =
-				rawPrefix.length > 0 && !usesBoundedPathCompletion
-					? await this.#getFuzzyFileSuggestions(rawPrefix, { isQuotedPrefix }, scopedQuery)
-					: await this.#getFileSuggestions(atPrefix, {
-							bounded: usesBoundedPathCompletion,
-							fuzzy: usesBoundedPathCompletion,
-							resolveEnumerationDir:
-								scopedQuery?.useBoundedEnumeration === true && !usesImmediateBoundedPathCompletion,
-						});
-			if (suggestions.length === 0 && rawPrefix.length > 0 && !usesBoundedPathCompletion) {
-				const fallback = await this.#getFileSuggestions(atPrefix);
-				if (fallback.length === 0) return null;
-				return { items: fallback, prefix: atPrefix };
-			}
-			if (suggestions.length === 0) return null;
+			let admissionHeld = true;
+			try {
+				let scopedQuery: ScopedFuzzyQuery | null = null;
+				if (rawPrefix.length > 0 && !usesImmediateBoundedPathCompletion) {
+					scopedQuery = await this.#resolveScopedFuzzyQuery(rawPrefix);
+				}
+				if (
+					rawPrefix.length > 0 &&
+					!usesImmediateBoundedPathCompletion &&
+					/[\\/]/.test(rawPrefix) &&
+					scopedQuery === null
+				) {
+					return null;
+				}
+				const usesBoundedPathCompletion =
+					usesImmediateBoundedPathCompletion || scopedQuery?.useBoundedEnumeration === true;
+				if (!usesBoundedPathCompletion) {
+					releaseAdmission();
+					admissionHeld = false;
+				}
+				const suggestions =
+					rawPrefix.length > 0 && !usesBoundedPathCompletion
+						? await this.#getFuzzyFileSuggestions(rawPrefix, { isQuotedPrefix }, scopedQuery)
+						: await this.#getFileSuggestions(atPrefix, {
+								bounded: usesBoundedPathCompletion,
+								fuzzy: usesBoundedPathCompletion,
+								resolveEnumerationDir:
+									(scopedQuery?.useBoundedEnumeration === true && !usesImmediateBoundedPathCompletion) ||
+									this.#isWindowsDriveRelativePrefix(rawPrefix),
+							});
+				if (suggestions.length === 0 && rawPrefix.length > 0 && !usesBoundedPathCompletion) {
+					const fallback = await this.#getFileSuggestions(atPrefix);
+					if (fallback.length === 0) return null;
+					return { items: fallback, prefix: atPrefix };
+				}
+				if (suggestions.length === 0) return null;
 
-			return {
-				items: suggestions,
-				prefix: atPrefix,
-			};
+				return {
+					items: suggestions,
+					prefix: atPrefix,
+				};
+			} finally {
+				if (admissionHeld) {
+					releaseAdmission();
+				}
+			}
 		}
 
 		// Check for slash commands at the submitted-message start
@@ -686,7 +711,7 @@ export class CombinedAutocompleteProvider implements AutocompleteProvider {
 	}
 
 	#isWindowsDriveRelativePrefix(prefix: string): boolean {
-		return /^[A-Za-z]:[^\\/]*$/.test(prefix);
+		return /^[A-Za-z]:(?![\\/])/.test(prefix);
 	}
 
 	#isTerminalParentPathPrefix(prefix: string): boolean {
@@ -828,6 +853,34 @@ export class CombinedAutocompleteProvider implements AutocompleteProvider {
 		return filePath.split(/[\\/]+/).some(segment => segment === "..");
 	}
 
+	#tryAcquireScopedPathAdmission(rawPrefix: string, usesImmediateBoundedEnumeration: boolean): (() => void) | null {
+		const separatorIndex = Math.max(rawPrefix.lastIndexOf("/"), rawPrefix.lastIndexOf("\\"));
+		if (usesImmediateBoundedEnumeration || separatorIndex === -1) {
+			return () => {};
+		}
+
+		const key = rawPrefix.slice(0, separatorIndex + 1);
+		const currentCount = this.#scopedPathAdmissions.get(key);
+		if (currentCount === undefined && this.#scopedPathAdmissions.size >= this.#MAX_BOUNDED_PENDING) {
+			return null;
+		}
+		this.#scopedPathAdmissions.set(key, (currentCount ?? 0) + 1);
+
+		let released = false;
+		return () => {
+			if (released) {
+				return;
+			}
+			released = true;
+			const remaining = (this.#scopedPathAdmissions.get(key) ?? 1) - 1;
+			if (remaining <= 0) {
+				this.#scopedPathAdmissions.delete(key);
+			} else {
+				this.#scopedPathAdmissions.set(key, remaining);
+			}
+		};
+	}
+
 	#isPathWithin(rootPath: string, candidatePath: string): boolean {
 		const relative = path.relative(path.resolve(rootPath), path.resolve(candidatePath));
 		return (
@@ -849,6 +902,9 @@ export class CombinedAutocompleteProvider implements AutocompleteProvider {
 	}
 
 	async #resolveEnumerationDir(searchDir: string): Promise<string> {
+		if (process.platform === "win32" && this.#isWindowsDriveRelativePrefix(searchDir)) {
+			searchDir = path.resolve(searchDir);
+		}
 		if (!path.isAbsolute(searchDir)) {
 			return searchDir;
 		}
@@ -931,33 +987,29 @@ export class CombinedAutocompleteProvider implements AutocompleteProvider {
 		}
 
 		const generation = this.#boundedDirGeneration;
-		let resolveRequest!: (result: CachedBoundedDirResult | null) => void;
-		const request = new Promise<CachedBoundedDirResult | null>(resolve => {
-			resolveRequest = resolve;
-		});
+		const deferred = Promise.withResolvers<CachedBoundedDirResult | null>();
+		const request = deferred.promise;
 		this.#boundedDirPending.set(key, request);
 
-		void Promise.resolve().then(async () => {
-			try {
-				const result = await Promise.resolve(readDirLimited({ path: searchDir, limit })).then(value => ({
-					entries: Array.isArray(value.entries) ? value.entries : [],
-					truncated: value.truncated === true,
-				}));
-				if (generation === this.#boundedDirGeneration) {
-					this.#boundedDirCache.set(key, { result, timestamp: Date.now() });
-					this.#pruneDirCache(this.#boundedDirCache);
-				}
-				resolveRequest(result);
-			} catch {
-				resolveRequest(null);
-			} finally {
-				if (this.#boundedDirPending.get(key) === request) {
-					this.#boundedDirPending.delete(key);
-				}
+		try {
+			const result = await Promise.resolve(readDirLimited({ path: searchDir, limit })).then(value => ({
+				entries: Array.isArray(value.entries) ? value.entries : [],
+				truncated: value.truncated === true,
+			}));
+			if (generation === this.#boundedDirGeneration) {
+				this.#boundedDirCache.set(key, { result, timestamp: Date.now() });
+				this.#pruneDirCache(this.#boundedDirCache);
 			}
-		});
-
-		return request;
+			deferred.resolve(result);
+			return result;
+		} catch {
+			deferred.resolve(null);
+			return null;
+		} finally {
+			if (this.#boundedDirPending.get(key) === request) {
+				this.#boundedDirPending.delete(key);
+			}
+		}
 	}
 
 	invalidateDirCache(dir?: string): void {
@@ -993,22 +1045,43 @@ export class CombinedAutocompleteProvider implements AutocompleteProvider {
 	async #getAutomaticPathSuggestions(prefix: string): Promise<AutocompleteItem[]> {
 		const { rawPrefix } = parsePathPrefix(prefix);
 		const usesImmediateBoundedEnumeration = this.#isImmediatelyUnsafeAutomaticPrefix(rawPrefix);
-		let scopedQuery: ScopedFuzzyQuery | null = null;
-		if (rawPrefix.length > 0 && !usesImmediateBoundedEnumeration) {
-			scopedQuery = await this.#resolveScopedFuzzyQuery(rawPrefix);
-		}
-		if (scopedQuery === null && this.#hasParentPathSegment(rawPrefix)) {
+		const releaseAdmission = this.#tryAcquireScopedPathAdmission(rawPrefix, usesImmediateBoundedEnumeration);
+		if (releaseAdmission === null) {
 			return [];
 		}
+		let admissionHeld = true;
+		try {
+			let scopedQuery: ScopedFuzzyQuery | null = null;
+			if (rawPrefix.length > 0 && !usesImmediateBoundedEnumeration) {
+				scopedQuery = await this.#resolveScopedFuzzyQuery(rawPrefix);
+			}
+			if (
+				rawPrefix.length > 0 &&
+				!usesImmediateBoundedEnumeration &&
+				/[\\/]/.test(rawPrefix) &&
+				scopedQuery === null
+			) {
+				return [];
+			}
 
-		const usesBoundedEnumeration = usesImmediateBoundedEnumeration || scopedQuery?.useBoundedEnumeration === true;
-		return this.#getFileSuggestions(prefix, {
-			bounded: usesBoundedEnumeration,
-			resolveEnumerationDir:
-				(scopedQuery?.useBoundedEnumeration === true && !usesImmediateBoundedEnumeration) ||
-				(!usesBoundedEnumeration && this.#hasParentPathSegment(rawPrefix)),
-			preserveLiteralDir: usesBoundedEnumeration,
-		});
+			const usesBoundedEnumeration = usesImmediateBoundedEnumeration || scopedQuery?.useBoundedEnumeration === true;
+			if (!usesBoundedEnumeration) {
+				releaseAdmission();
+				admissionHeld = false;
+			}
+			return await this.#getFileSuggestions(prefix, {
+				bounded: usesBoundedEnumeration,
+				resolveEnumerationDir:
+					(scopedQuery?.useBoundedEnumeration === true && !usesImmediateBoundedEnumeration) ||
+					(!usesBoundedEnumeration && this.#hasParentPathSegment(rawPrefix)) ||
+					this.#isWindowsDriveRelativePrefix(rawPrefix),
+				preserveLiteralDir: usesBoundedEnumeration,
+			});
+		} finally {
+			if (admissionHeld) {
+				releaseAdmission();
+			}
+		}
 	}
 
 	#buildRelativePath(displayPrefix: string, name: string, options?: { preserveLiteralDir?: boolean }): string {
@@ -1286,14 +1359,18 @@ export class CombinedAutocompleteProvider implements AutocompleteProvider {
 			const topEntries = filteredMatches.slice(0, 20);
 			const suggestions: AutocompleteItem[] = [];
 			for (const { path: entryPath, isDirectory } of topEntries) {
-				const pathWithoutSlash = isDirectory ? entryPath.slice(0, -1) : entryPath;
-				const displayPath = resolvedScopedQuery
-					? this.#scopedPathForDisplay(resolvedScopedQuery.displayBase, pathWithoutSlash)
+				const pathWithoutSlash = isDirectory ? entryPath.replace(/[\\/]$/, "") : entryPath;
+				const displaySeparator = resolvedScopedQuery
+					? this.#directorySuffixForPrefix(resolvedScopedQuery.displayBase)
+					: "/";
+				const displayedEntryPath = resolvedScopedQuery
+					? pathWithoutSlash.replace(/[\\/]/g, displaySeparator)
 					: pathWithoutSlash;
-				const entryName = path.basename(pathWithoutSlash);
-				const completionPath = isDirectory
-					? `${displayPath}${this.#directorySuffixForPrefix(displayPath)}`
-					: displayPath;
+				const displayPath = resolvedScopedQuery
+					? this.#scopedPathForDisplay(resolvedScopedQuery.displayBase, displayedEntryPath)
+					: displayedEntryPath;
+				const entryName = pathWithoutSlash.split(/[\\/]/).at(-1) ?? pathWithoutSlash;
+				const completionPath = isDirectory ? `${displayPath}${displaySeparator}` : displayPath;
 				const value = buildCompletionValue(completionPath, {
 					isDirectory,
 					isAtPrefix: true,
@@ -1330,7 +1407,9 @@ export class CombinedAutocompleteProvider implements AutocompleteProvider {
 		if (pathMatch !== null) {
 			const { rawPrefix } = parsePathPrefix(pathMatch);
 			const usesLiteralPathSemantics =
-				this.#isAbsoluteOrHomePrefix(rawPrefix) || this.#hasParentPathSegment(rawPrefix);
+				this.#isAbsoluteOrHomePrefix(rawPrefix) ||
+				this.#isWindowsDriveRelativePrefix(rawPrefix) ||
+				this.#hasParentPathSegment(rawPrefix);
 			const suggestions = await this.#getFileSuggestions(pathMatch, {
 				preserveLiteralDir: usesLiteralPathSemantics,
 				resolveEnumerationDir: usesLiteralPathSemantics,
