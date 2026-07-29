@@ -414,11 +414,16 @@ export class CustomEditor extends Editor {
 		// Default behavior keeps autocomplete dismissal, but parent can prioritize global interrupt handling.
 		if (this.#matchesAction(data, "app.interrupt")) {
 			if (!this.isShowingAutocomplete() || this.shouldBypassAutocompleteOnEscape?.()) {
+				const cancelledHiddenPendingAutocomplete =
+					!this.isShowingAutocomplete() && this.cancelPendingAutocompleteWork();
 				// A priority interrupt consumer (e.g. an open btw panel) must win over any
 				// transient onEscape handler other controllers install (auto-compaction,
 				// auto-retry, manual compaction, etc.) so dismissal stays wired regardless
 				// of which handler currently owns onEscape.
 				if (this.onInterruptPriority?.()) {
+					return;
+				}
+				if (cancelledHiddenPendingAutocomplete) {
 					return;
 				}
 				if (this.onEscape) {

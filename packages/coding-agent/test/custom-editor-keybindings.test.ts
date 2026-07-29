@@ -312,6 +312,91 @@ describe("CustomEditor pasteImage default sourced from KEYBINDINGS", () => {
 });
 
 describe("CustomEditor bracketed paste interception", () => {
+	it("cancels a hidden pending autocomplete request before dispatching interrupt escape handlers", async () => {
+		const editor = createEditor();
+		const onEscape = vi.fn();
+		const requestStarted = Promise.withResolvers<AbortSignal>();
+		editor.onEscape = onEscape;
+		editor.setAutocompleteProvider({
+			async getSuggestions(_lines, _cursorLine, _cursorCol, signal) {
+				if (!signal) throw new Error("expected autocomplete cancellation signal");
+				requestStarted.resolve(signal);
+				const pending = Promise.withResolvers<never>();
+				signal.addEventListener("abort", () => pending.reject(signal.reason), { once: true });
+				return pending.promise;
+			},
+			applyCompletion(lines, cursorLine, cursorCol) {
+				return { lines, cursorLine, cursorCol };
+			},
+		} satisfies AutocompleteProvider);
+
+		editor.handleInput("@");
+		const signal = await requestStarted.promise;
+
+		try {
+			expect(editor.isShowingAutocomplete()).toBe(false);
+
+			editor.handleInput("\x1b");
+
+			expect(signal.aborted).toBe(true);
+			expect(onEscape).not.toHaveBeenCalled();
+			expect(editor.isShowingAutocomplete()).toBe(false);
+		} finally {
+			editor.handleInput("\x1b");
+			await Bun.sleep(0);
+		}
+	});
+
+	it("aborts hidden pending autocomplete before a priority interrupt consumer and ignores late results", async () => {
+		const editor = createEditor();
+		const onEscape = vi.fn();
+		const onInterruptPriority = vi.fn(() => true);
+		const requestStarted = Promise.withResolvers<AbortSignal>();
+		const pending = Promise.withResolvers<{
+			items: Array<{ label: string; value: string }>;
+			prefix: string;
+		} | null>();
+		const onAutocompleteUpdate = vi.fn();
+		editor.onEscape = onEscape;
+		editor.onInterruptPriority = onInterruptPriority;
+		editor.onAutocompleteUpdate = onAutocompleteUpdate;
+		editor.setAutocompleteProvider({
+			async getSuggestions(_lines, _cursorLine, _cursorCol, signal) {
+				if (!signal) throw new Error("expected autocomplete cancellation signal");
+				requestStarted.resolve(signal);
+				return pending.promise;
+			},
+			applyCompletion(lines, cursorLine, cursorCol) {
+				return { lines, cursorLine, cursorCol };
+			},
+		} satisfies AutocompleteProvider);
+
+		editor.handleInput("@");
+		const signal = await requestStarted.promise;
+
+		try {
+			expect(editor.isShowingAutocomplete()).toBe(false);
+
+			editor.handleInput("\x1b");
+
+			expect(signal.aborted).toBe(true);
+			expect(onInterruptPriority).toHaveBeenCalledTimes(1);
+			expect(onEscape).not.toHaveBeenCalled();
+			expect(editor.isShowingAutocomplete()).toBe(false);
+			expect(editor.isAutocompleteOpen()).toBe(false);
+
+			pending.resolve({ items: [{ label: "src/", value: "src/" }], prefix: "@" });
+			await Bun.sleep(0);
+
+			expect(onAutocompleteUpdate).not.toHaveBeenCalled();
+			expect(editor.isShowingAutocomplete()).toBe(false);
+			expect(editor.isAutocompleteOpen()).toBe(false);
+		} finally {
+			editor.handleInput("\x1b");
+			await Bun.sleep(0);
+		}
+	});
+
 	it("does not retain a standalone Escape as a possible paste prefix", () => {
 		const editor = createEditor();
 		const onEscape = vi.fn();

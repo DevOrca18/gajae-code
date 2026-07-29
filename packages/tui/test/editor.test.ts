@@ -9,6 +9,12 @@ import { KeybindingsManager, setKeybindings, TUI_KEYBINDINGS } from "../src/keyb
 import { StdinBuffer } from "../src/stdin-buffer";
 import { defaultEditorTheme } from "./test-themes";
 
+function createAbortOnlyPromise(signal: AbortSignal): Promise<never> {
+	const pending = Promise.withResolvers<never>();
+	signal.addEventListener("abort", () => pending.reject(signal.reason), { once: true });
+	return pending.promise;
+}
+
 describe("Editor component", () => {
 	const originalTabWidth = getDefaultTabWidth();
 
@@ -356,16 +362,17 @@ describe("Editor component", () => {
 					latestText = (lines[cursorLine] ?? "").slice(0, cursorCol);
 					active += 1;
 					peakActive = Math.max(peakActive, active);
-					return new Promise((_resolve, reject) => {
-						signal?.addEventListener(
-							"abort",
-							() => {
-								active -= 1;
-								reject(signal.reason);
-							},
-							{ once: true },
-						);
-					});
+					if (!signal) throw new Error("expected autocomplete cancellation signal");
+					const pending = Promise.withResolvers<never>();
+					signal.addEventListener(
+						"abort",
+						() => {
+							active -= 1;
+							pending.reject(signal.reason);
+						},
+						{ once: true },
+					);
+					return pending.promise;
 				},
 				applyCompletion(lines, cursorLine, cursorCol) {
 					return { lines, cursorLine, cursorCol };
@@ -396,9 +403,7 @@ describe("Editor component", () => {
 				async getSuggestions(_lines, _cursorLine, _cursorCol, signal) {
 					if (!signal) throw new Error("expected autocomplete cancellation signal");
 					requestStarted.resolve(signal);
-					return new Promise((_resolve, reject) => {
-						signal.addEventListener("abort", () => reject(signal.reason), { once: true });
-					});
+					return createAbortOnlyPromise(signal);
 				},
 				applyCompletion(lines, cursorLine, cursorCol) {
 					return { lines, cursorLine, cursorCol };
@@ -427,9 +432,7 @@ describe("Editor component", () => {
 				async getSuggestions(_lines, _cursorLine, _cursorCol, signal) {
 					if (!signal) throw new Error("expected autocomplete cancellation signal");
 					requestStarted.resolve(signal);
-					return new Promise((_resolve, reject) => {
-						signal.addEventListener("abort", () => reject(signal.reason), { once: true });
-					});
+					return createAbortOnlyPromise(signal);
 				},
 				applyCompletion(lines, cursorLine, cursorCol) {
 					return { lines, cursorLine, cursorCol };
@@ -447,6 +450,191 @@ describe("Editor component", () => {
 				editor.handleInput("\x1b");
 				await Bun.sleep(0);
 			}
+		});
+
+		it("does not reopen autocomplete when a disposed request resolves after ignoring abort", async () => {
+			const editor = new Editor(defaultEditorTheme);
+			const pending = Promise.withResolvers<{
+				items: Array<{ label: string; value: string }>;
+				prefix: string;
+			} | null>();
+			let updates = 0;
+			editor.onAutocompleteUpdate = () => {
+				updates += 1;
+			};
+
+			editor.setAutocompleteProvider({
+				async getSuggestions() {
+					return pending.promise;
+				},
+				applyCompletion(lines, cursorLine, cursorCol) {
+					return { lines, cursorLine, cursorCol };
+				},
+			});
+
+			editor.handleInput("@");
+			await Bun.sleep(0);
+			editor.dispose();
+
+			pending.resolve({ items: [{ label: "src/", value: "src/" }], prefix: "@" });
+			await Bun.sleep(0);
+
+			expect(updates).toBe(0);
+			expect(editor.isShowingAutocomplete()).toBe(false);
+			expect(editor.isAutocompleteOpen()).toBe(false);
+		});
+
+		it("closes a settled autocomplete popup on escape and reports cancellation", async () => {
+			const editor = new Editor(defaultEditorTheme);
+			const cancellations: number[] = [];
+			editor.onAutocompleteCancel = () => {
+				cancellations.push(1);
+			};
+
+			editor.setAutocompleteProvider({
+				async getSuggestions() {
+					return { items: [{ label: "src/", value: "src/" }], prefix: "@" };
+				},
+				applyCompletion(lines, cursorLine, cursorCol) {
+					return { lines, cursorLine, cursorCol };
+				},
+			});
+
+			editor.handleInput("@");
+			await Bun.sleep(0);
+			expect(editor.isShowingAutocomplete()).toBe(true);
+			expect(editor.isAutocompleteOpen()).toBe(true);
+
+			editor.handleInput("\x1b");
+
+			expect(cancellations).toHaveLength(1);
+			expect(editor.isShowingAutocomplete()).toBe(false);
+			expect(editor.isAutocompleteOpen()).toBe(false);
+		});
+
+		it.each([
+			[
+				"ctrl+u",
+				(editor: Editor) => {
+					editor.setText("@seed");
+				},
+				(editor: Editor) => editor.handleInput("\x15"),
+			],
+			[
+				"ctrl+k",
+				(editor: Editor) => {
+					editor.setText("@seed");
+					editor.moveToLineStart();
+					editor.handleInput("\x1b[C");
+				},
+				(editor: Editor) => editor.handleInput("\x0b"),
+			],
+			[
+				"newline",
+				(editor: Editor) => {
+					editor.setText("@seed");
+				},
+				(editor: Editor) => editor.handleInput("\n"),
+			],
+			[
+				"yank",
+				(editor: Editor) => {
+					editor.setText("seed");
+					editor.handleInput("\x15");
+					editor.setText("@");
+				},
+				(editor: Editor) => editor.handleInput("\x19"),
+			],
+			[
+				"yank-pop",
+				(editor: Editor) => {
+					editor.setText("first");
+					editor.handleInput("\x15");
+					editor.setText("second");
+					editor.handleInput("\x15");
+					editor.setText("@");
+					editor.handleInput("\x19");
+				},
+				(editor: Editor) => editor.handleInput("\x1by"),
+			],
+			[
+				"undo",
+				(editor: Editor) => {
+					editor.setText("@");
+					editor.handleInput("x");
+				},
+				(editor: Editor) => editor.handleInput("\x1b[45;5u"),
+			],
+		])("aborts an in-flight autocomplete request after %s edits the document", async (_name, setup, edit) => {
+			const editor = new Editor(defaultEditorTheme);
+			const requestStarted = Promise.withResolvers<AbortSignal>();
+			const provider = {
+				async getSuggestions() {
+					return null;
+				},
+				applyCompletion(lines: string[], cursorLine: number, cursorCol: number) {
+					return { lines, cursorLine, cursorCol };
+				},
+				async getForceFileSuggestions(
+					_lines: string[],
+					_cursorLine: number,
+					_cursorCol: number,
+					signal?: AbortSignal,
+				) {
+					if (!signal) throw new Error("expected autocomplete cancellation signal");
+					requestStarted.resolve(signal);
+					return createAbortOnlyPromise(signal);
+				},
+			} satisfies AutocompleteProvider & {
+				getForceFileSuggestions(
+					lines: string[],
+					cursorLine: number,
+					cursorCol: number,
+					signal?: AbortSignal,
+				): Promise<never>;
+			};
+			editor.setAutocompleteProvider(provider);
+
+			setup(editor);
+			editor.handleInput("\t");
+			const signal = await requestStarted.promise;
+
+			try {
+				edit(editor);
+				expect(signal.aborted).toBe(true);
+				expect(editor.isShowingAutocomplete()).toBe(false);
+			} finally {
+				editor.handleInput("\x1b");
+				await Bun.sleep(0);
+			}
+		});
+
+		it("re-triggers file autocomplete inside an open quoted @ mention with spaces", async () => {
+			const editor = new Editor(defaultEditorTheme);
+			const calls = Promise.withResolvers<string[]>();
+			const seen: string[] = [];
+
+			editor.setAutocompleteProvider({
+				async getSuggestions(lines, cursorLine, cursorCol) {
+					seen.push((lines[cursorLine] ?? "").slice(0, cursorCol));
+					if (seen.length === 2) {
+						calls.resolve([...seen]);
+					}
+					return {
+						items: [{ label: "nested/", value: '@"dir with spaces/nested/' }],
+						prefix: '@"dir with spaces/n',
+					};
+				},
+				applyCompletion(lines, cursorLine, cursorCol) {
+					return { lines, cursorLine, cursorCol };
+				},
+			});
+
+			editor.handleInput("@");
+			editor.setText('@"dir with spaces/');
+			editor.handleInput("n");
+
+			await expect(calls.promise).resolves.toEqual(["@", '@"dir with spaces/n']);
 		});
 
 		it("triggers prompt-action autocomplete when typing hash", async () => {

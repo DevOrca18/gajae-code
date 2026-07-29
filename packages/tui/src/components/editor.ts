@@ -3,6 +3,7 @@ import {
 	type AutocompleteItem,
 	type AutocompleteProvider,
 	type CombinedAutocompleteProvider,
+	extractAtFileMentionPrefix,
 	extractSlashCommandTokenPrefix,
 	isInsideInlineCodeSpan,
 } from "../autocomplete";
@@ -522,8 +523,7 @@ export class Editor implements Component, Focusable {
 	dispose(): void {
 		this.#disposeTabWidthListener?.();
 		this.#disposeTabWidthListener = undefined;
-		this.#abortAutocompleteRequest();
-		this.#clearAutocompleteTimeout();
+		this.#cancelAutocomplete();
 	}
 
 	setAutocompleteProvider(provider: AutocompleteProvider): void {
@@ -719,6 +719,8 @@ export class Editor implements Component, Focusable {
 	}
 
 	#bumpDocumentVersion(): void {
+		this.#abortAutocompleteRequest();
+		this.#clearAutocompleteTimeout();
 		this.#docVersion += 1;
 		this.#layoutCache = undefined;
 	}
@@ -1161,8 +1163,7 @@ export class Editor implements Component, Focusable {
 			}
 			return;
 		}
-		if (!this.#autocompleteState && this.#autocompleteRequestController && kb.matches(data, "tui.select.cancel")) {
-			this.#cancelAutocomplete();
+		if (!this.#autocompleteState && kb.matches(data, "tui.select.cancel") && this.cancelPendingAutocompleteWork()) {
 			return;
 		}
 
@@ -1916,7 +1917,7 @@ export class Editor implements Component, Focusable {
 			else if (char === "~") {
 				const currentLine = this.#state.lines[this.#state.cursorLine] || "";
 				const textBeforeCursor = currentLine.slice(0, this.#state.cursorCol);
-				if (textBeforeCursor.match(/(?:^|[\s])@[^\s]*$/)) {
+				if (extractAtFileMentionPrefix(textBeforeCursor) !== null) {
 					this.#tryTriggerAutocomplete();
 				}
 			}
@@ -1929,7 +1930,7 @@ export class Editor implements Component, Focusable {
 					this.#tryTriggerAutocomplete();
 				}
 				// Check if we're in an @ file reference context
-				else if (textBeforeCursor.match(/(?:^|[\s])@[^\s]*$/)) {
+				else if (extractAtFileMentionPrefix(textBeforeCursor) !== null) {
 					this.#tryTriggerAutocomplete();
 				}
 				// Check if we're in a # prompt action context
@@ -2127,7 +2128,7 @@ export class Editor implements Component, Focusable {
 				this.#tryTriggerAutocomplete();
 			}
 			// @ file reference context
-			else if (textBeforeCursor.match(/(?:^|[\s])@[^\s]*$/)) {
+			else if (extractAtFileMentionPrefix(textBeforeCursor) !== null) {
 				this.#tryTriggerAutocomplete();
 			}
 			// # prompt action context
@@ -2309,7 +2310,7 @@ export class Editor implements Component, Focusable {
 			const textBeforeCursor = currentLine.slice(0, this.#state.cursorCol);
 			if (this.#isInSubmittedSlashCommandContext() || this.#isInSlashTokenContext()) {
 				this.#tryTriggerAutocomplete();
-			} else if (textBeforeCursor.match(/(?:^|[\s])@[^\s]*$/)) {
+			} else if (extractAtFileMentionPrefix(textBeforeCursor) !== null) {
 				this.#tryTriggerAutocomplete();
 			} else if (textBeforeCursor.match(/#[^\s#]*$/)) {
 				this.#tryTriggerAutocomplete();
@@ -2627,7 +2628,7 @@ export class Editor implements Component, Focusable {
 				this.#tryTriggerAutocomplete();
 			}
 			// @ file reference context
-			else if (textBeforeCursor.match(/(?:^|[\s])@[^\s]*$/)) {
+			else if (extractAtFileMentionPrefix(textBeforeCursor) !== null) {
 				this.#tryTriggerAutocomplete();
 			}
 			// # prompt action context
@@ -3077,9 +3078,10 @@ https://github.com/EsotericSoftware/spine-runtimes/actions/runs/19536643416/job/
 
 	#cancelAutocomplete(notifyCancel: boolean = false): void {
 		const wasAutocompleting = this.#autocompleteState !== null;
-		this.#abortAutocompleteRequest();
-		this.#clearAutocompleteTimeout();
-		this.#autocompleteRequestId += 1;
+		const invalidatedPendingWork = this.cancelPendingAutocompleteWork();
+		if (!invalidatedPendingWork) {
+			this.#autocompleteRequestId += 1;
+		}
 		this.#autocompleteState = null;
 		this.#autocompleteList = undefined;
 		this.#autocompleteOrigin = undefined;
@@ -3149,6 +3151,18 @@ https://github.com/EsotericSoftware/spine-runtimes/actions/runs/19536643416/job/
 			clearTimeout(this.#autocompleteTimeout);
 			this.#autocompleteTimeout = undefined;
 		}
+	}
+
+	protected cancelPendingAutocompleteWork(): boolean {
+		const hadPendingWork =
+			this.#autocompleteRequestController !== undefined || this.#autocompleteTimeout !== undefined;
+		if (!hadPendingWork) {
+			return false;
+		}
+		this.#abortAutocompleteRequest();
+		this.#clearAutocompleteTimeout();
+		this.#autocompleteRequestId += 1;
+		return true;
 	}
 
 	#abortAutocompleteRequest(): void {
