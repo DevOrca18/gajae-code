@@ -5,6 +5,7 @@
 ### Fixed
 
 - Kitty/Ghostty inline images no longer remain visually pinned when sticky or semantic viewport repaints move their anchors into application scrollback. The renderer now soft-deletes only the named placement from the old viewport, retains uploaded pixels for history replay, and keeps placement tracking aligned across unresolved-anchor and follow-live transitions.
+- Automatic unsafe path completion now routes absolute, home, ancestor-escape, sibling, external-symlink, malformed, and non-directory scopes through provider-local bounded native directory enumeration keyed by normalized directory plus limit, failing closed instead of falling back to recursive discovery while preserving ordinary relative fuzzy search and exhaustive `Tab` completion.
 
 ## [0.12.0] - 2026-07-28
 

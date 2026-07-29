@@ -1,8 +1,53 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import * as nativeModule from "@gajae-code/natives";
 import { CombinedAutocompleteProvider, extractSlashCommandTokenPrefix } from "@gajae-code/tui/autocomplete";
+
+type MockDirEntry = nativeModule.ReadDirLimitedEntry;
+type MockReadDirLimitedResult = nativeModule.ReadDirLimitedResult;
+
+function makeReadDirLimitedResult(entries: MockDirEntry[], truncated: boolean = false): MockReadDirLimitedResult {
+	return { entries, truncated };
+}
+
+function makeFuzzyFindResult(matches: nativeModule.FuzzyFindMatch[]): nativeModule.FuzzyFindResult {
+	return { matches, totalMatches: matches.length };
+}
+
+async function waitForStableNumber(
+	read: () => number,
+	options: { maxTicks?: number; stableTicks?: number } = {},
+): Promise<number> {
+	const maxTicks = options.maxTicks ?? 50;
+	const stableTicks = options.stableTicks ?? 3;
+	let lastValue = read();
+	let unchangedTicks = 0;
+
+	for (let tick = 0; tick < maxTicks; tick += 1) {
+		await Bun.sleep(1);
+		const nextValue = read();
+		if (nextValue === lastValue) {
+			unchangedTicks += 1;
+			if (unchangedTicks >= stableTicks) return nextValue;
+		} else {
+			lastValue = nextValue;
+			unchangedTicks = 0;
+		}
+	}
+
+	return read();
+}
+
+async function waitForAtLeastNumber(read: () => number, minimum: number, maxTicks: number = 100): Promise<number> {
+	for (let tick = 0; tick < maxTicks; tick += 1) {
+		const value = read();
+		if (value >= minimum) return value;
+		await Bun.sleep(1);
+	}
+	return read();
+}
 
 describe("CombinedAutocompleteProvider", () => {
 	describe("extractPathPrefix", () => {
@@ -100,7 +145,7 @@ describe("CombinedAutocompleteProvider", () => {
 		});
 	});
 
-	describe("@ fuzzy search scoped paths", () => {
+	describe("@ scoped path handling", () => {
 		let rootDir: string;
 		let baseDir: string;
 		let outsideDir: string;
@@ -117,9 +162,10 @@ describe("CombinedAutocompleteProvider", () => {
 			fs.rmSync(rootDir, { recursive: true, force: true });
 		});
 
-		it("scopes @ fuzzy search to the typed relative path prefix", async () => {
+		it("bounds existing off-project sibling scopes to direct entries only", async () => {
 			fs.writeFileSync(path.join(baseDir, "alpha-local.ts"), "export const local = 1;\n");
 			fs.mkdirSync(path.join(outsideDir, "nested", "deeper"), { recursive: true });
+			fs.writeFileSync(path.join(outsideDir, "alpha.ts"), "export const alpha = 1;\n");
 			fs.writeFileSync(path.join(outsideDir, "nested", "alpha.ts"), "export const alpha = 1;\n");
 			fs.writeFileSync(path.join(outsideDir, "nested", "deeper", "also-alpha.ts"), "export const also = 1;\n");
 			fs.writeFileSync(path.join(outsideDir, "nested", "deeper", "zzz.ts"), "export const zzz = 1;\n");
@@ -129,10 +175,115 @@ describe("CombinedAutocompleteProvider", () => {
 			const result = await provider.getSuggestions([line], 0, line.length);
 
 			const values = result?.items.map(item => item.value) ?? [];
-			expect(values).toContain("@../outside/nested/alpha.ts");
-			expect(values).toContain("@../outside/nested/deeper/also-alpha.ts");
+			expect(values).toContain("@../outside/alpha.ts");
+			expect(values).not.toContain("@../outside/nested/alpha.ts");
+			expect(values).not.toContain("@../outside/nested/deeper/also-alpha.ts");
 			expect(values).not.toContain("@../outside/nested/deeper/zzz.ts");
 			expect(values.some(value => value.includes("alpha-local.ts"))).toBe(false);
+		});
+
+		it("keeps project-contained scoped relative prefixes on recursive fuzzy discovery", async () => {
+			fs.mkdirSync(path.join(baseDir, "src", "nested", "deeper"), { recursive: true });
+			fs.writeFileSync(path.join(baseDir, "src", "nested", "alpha.ts"), "export const alpha = 1;\n");
+			fs.writeFileSync(path.join(baseDir, "src", "nested", "deeper", "also-alpha.ts"), "export const also = 1;\n");
+			fs.writeFileSync(path.join(baseDir, "src", "nested", "deeper", "zzz.ts"), "export const zzz = 1;\n");
+
+			const provider = new CombinedAutocompleteProvider([], baseDir);
+			const line = "@src/a";
+			const result = await provider.getSuggestions([line], 0, line.length);
+
+			const values = result?.items.map(item => item.value) ?? [];
+			expect(values).toContain("@src/nested/alpha.ts");
+			expect(values).toContain("@src/nested/deeper/also-alpha.ts");
+			expect(values).not.toContain("@src/nested/deeper/zzz.ts");
+		});
+
+		it("keeps project-contained parent segments on recursive fuzzy discovery", async () => {
+			fs.mkdirSync(path.join(baseDir, "src", "nested", "deeper"), { recursive: true });
+			fs.writeFileSync(path.join(baseDir, "src", "nested", "alpha.ts"), "export const alpha = 1;\n");
+			fs.writeFileSync(path.join(baseDir, "src", "nested", "deeper", "also-alpha.ts"), "export const also = 1;\n");
+
+			const provider = new CombinedAutocompleteProvider([], baseDir);
+			const line = "@src/../src/a";
+			const result = await provider.getSuggestions([line], 0, line.length);
+
+			const values = result?.items.map(item => item.value) ?? [];
+			expect(values).toContain("@src/../src/nested/alpha.ts");
+			expect(values).toContain("@src/../src/nested/deeper/also-alpha.ts");
+		});
+
+		it("keeps project-internal POSIX symlink prefixes on recursive fuzzy discovery", async () => {
+			if (process.platform === "win32") return;
+
+			const internalTargetDir = path.join(baseDir, "linked-target");
+			fs.mkdirSync(path.join(internalTargetDir, "nested", "deeper"), { recursive: true });
+			fs.writeFileSync(path.join(internalTargetDir, "nested", "alpha.ts"), "export const alpha = 1;\n");
+			fs.writeFileSync(
+				path.join(internalTargetDir, "nested", "deeper", "also-alpha.ts"),
+				"export const also = 1;\n",
+			);
+			fs.symlinkSync(internalTargetDir, path.join(baseDir, "linked-inside"), "dir");
+
+			const provider = new CombinedAutocompleteProvider([], baseDir);
+			const line = "@linked-inside/a";
+			const result = await provider.getSuggestions([line], 0, line.length);
+
+			const values = result?.items.map(item => item.value) ?? [];
+			expect(values).toContain("@linked-inside/nested/alpha.ts");
+			expect(values).toContain("@linked-inside/nested/deeper/also-alpha.ts");
+		});
+
+		it("bounds external POSIX symlink prefixes to direct entries only", async () => {
+			if (process.platform === "win32") return;
+
+			fs.mkdirSync(path.join(outsideDir, "nested", "deeper"), { recursive: true });
+			fs.writeFileSync(path.join(outsideDir, "alpha.ts"), "export const alpha = 1;\n");
+			fs.writeFileSync(path.join(outsideDir, "nested", "alpha.ts"), "export const nested = 1;\n");
+			fs.symlinkSync(outsideDir, path.join(baseDir, "linked-outside"), "dir");
+
+			const provider = new CombinedAutocompleteProvider([], baseDir);
+			const line = "@linked-outside/a";
+			const result = await provider.getSuggestions([line], 0, line.length);
+
+			const values = result?.items.map(item => item.value) ?? [];
+			expect(values).toContain("@linked-outside/alpha.ts");
+			expect(values).not.toContain("@linked-outside/nested/alpha.ts");
+		});
+
+		it("completes a bare external POSIX symlink without traversing its target", async () => {
+			if (process.platform === "win32") return;
+
+			fs.mkdirSync(path.join(outsideDir, "nested"), { recursive: true });
+			fs.writeFileSync(path.join(outsideDir, "nested", "linked-outside-only.ts"), "export const outside = 1;\n");
+			fs.symlinkSync(outsideDir, path.join(baseDir, "linked-outside"), "dir");
+
+			const provider = new CombinedAutocompleteProvider([], baseDir);
+			const line = "@linked-outside";
+			const result = await provider.getSuggestions([line], 0, line.length);
+
+			const values = result?.items.map(item => item.value) ?? [];
+			expect(values).toContain("@linked-outside/");
+			expect(values.some(value => value.startsWith("@linked-outside/") && value !== "@linked-outside/")).toBe(false);
+		});
+
+		it("keeps recursive fuzzy discovery inside the project symlink boundary", async () => {
+			if (process.platform === "win32") return;
+
+			const internalTargetDir = path.join(baseDir, "linked-target");
+			fs.mkdirSync(path.join(internalTargetDir, "nested"), { recursive: true });
+			fs.mkdirSync(path.join(outsideDir, "nested"), { recursive: true });
+			fs.writeFileSync(path.join(internalTargetDir, "nested", "inside-needle.ts"), "export const inside = 1;\n");
+			fs.writeFileSync(path.join(outsideDir, "nested", "outside-needle.ts"), "export const outside = 1;\n");
+			fs.symlinkSync(internalTargetDir, path.join(baseDir, "linked-inside"), "dir");
+			fs.symlinkSync(outsideDir, path.join(baseDir, "linked-outside"), "dir");
+
+			const provider = new CombinedAutocompleteProvider([], baseDir);
+			const line = "@needle";
+			const result = await provider.getSuggestions([line], 0, line.length);
+
+			const values = result?.items.map(item => item.value) ?? [];
+			expect(values).toContain("@linked-inside/nested/inside-needle.ts");
+			expect(values).not.toContain("@linked-outside/nested/outside-needle.ts");
 		});
 	});
 	describe("dot-slash path completion", () => {
@@ -470,5 +621,417 @@ describe("trySyncSlashCompletion", () => {
 		const colon = provider.trySyncSlashCompletion("/skill:te");
 		expect(dashed?.items[0]?.value).toBe("skill:team");
 		expect(colon?.items[0]?.value).toBe("skill:team");
+	});
+});
+
+describe("unsafe path autocomplete routing", () => {
+	let rootDir: string;
+	let baseDir: string;
+
+	beforeEach(() => {
+		rootDir = fs.mkdtempSync(path.join(os.tmpdir(), "autocomplete-unsafe-routing-"));
+		baseDir = path.join(rootDir, "cwd");
+		fs.mkdirSync(baseDir, { recursive: true });
+	});
+
+	afterEach(() => {
+		vi.restoreAllMocks();
+		fs.rmSync(rootDir, { recursive: true, force: true });
+	});
+
+	it("keeps ordinary relative @query on recursive fuzzy discovery", async () => {
+		let fuzzyCalls = 0;
+		let readDirLimitedCalls = 0;
+		vi.spyOn(nativeModule, "fuzzyFind").mockImplementation(async () => {
+			fuzzyCalls += 1;
+			return makeFuzzyFindResult([{ path: "src/foo.ts", isDirectory: false, score: 1 }]);
+		});
+		vi.spyOn(nativeModule, "readDirLimited").mockImplementation(async () => {
+			readDirLimitedCalls += 1;
+			return makeReadDirLimitedResult([]);
+		});
+		const provider = new CombinedAutocompleteProvider([], baseDir);
+		const line = "@foo";
+
+		const result = await provider.getSuggestions([line], 0, line.length);
+
+		expect(result?.items.map(item => item.value)).toEqual(["@src/foo.ts"]);
+		expect(fuzzyCalls).toBe(1);
+		expect(readDirLimitedCalls).toBe(0);
+	});
+
+	it("uses bounded native completion for direct sibling @ paths", async () => {
+		let fuzzyCalls = 0;
+		fs.mkdirSync(path.join(rootDir, "outside"), { recursive: true });
+		vi.spyOn(nativeModule, "fuzzyFind").mockImplementation(async () => {
+			fuzzyCalls += 1;
+			return makeFuzzyFindResult([{ path: "nested/recursive-only.ts", isDirectory: false, score: 1 }]);
+		});
+		vi.spyOn(nativeModule, "readDirLimited").mockImplementation(async () =>
+			makeReadDirLimitedResult([
+				{ name: "alpha.ts", isDirectory: false, isSymbolicLink: false },
+				{ name: "nested", isDirectory: true, isSymbolicLink: false },
+			]),
+		);
+		const provider = new CombinedAutocompleteProvider([], baseDir);
+		const line = "@../outside/a";
+
+		const result = await provider.getSuggestions([line], 0, line.length);
+
+		expect(result?.items.map(item => item.value)).toEqual(["@../outside/alpha.ts"]);
+		expect(fuzzyCalls).toBe(0);
+	});
+
+	it("uses bounded native completion for natural absolute paths", async () => {
+		let fuzzyCalls = 0;
+		let readDirLimitedCalls = 0;
+		vi.spyOn(nativeModule, "fuzzyFind").mockImplementation(async () => {
+			fuzzyCalls += 1;
+			return makeFuzzyFindResult([{ path: "recursive-only.ts", isDirectory: false, score: 1 }]);
+		});
+		vi.spyOn(nativeModule, "readDirLimited").mockImplementation(async () => {
+			readDirLimitedCalls += 1;
+			return makeReadDirLimitedResult([{ name: "alpha.ts", isDirectory: false, isSymbolicLink: false }]);
+		});
+		const provider = new CombinedAutocompleteProvider([], baseDir);
+		const prefix = path.join(baseDir, "a");
+		const line = `open ${prefix}`;
+
+		const result = await provider.getSuggestions([line], 0, line.length);
+
+		expect(result?.items.map(item => item.label)).toEqual(["alpha.ts"]);
+		expect(readDirLimitedCalls).toBe(1);
+		expect(fuzzyCalls).toBe(0);
+	});
+
+	it("preserves fuzzy abbreviation matching for bounded unsafe @ paths", async () => {
+		let fuzzyCalls = 0;
+		fs.mkdirSync(path.join(rootDir, "outside"), { recursive: true });
+		vi.spyOn(nativeModule, "fuzzyFind").mockImplementation(async () => {
+			fuzzyCalls += 1;
+			return makeFuzzyFindResult([]);
+		});
+		vi.spyOn(nativeModule, "readDirLimited").mockImplementation(async () =>
+			makeReadDirLimitedResult([
+				{ name: "history-search.ts", isDirectory: false, isSymbolicLink: false },
+				{ name: "helper.ts", isDirectory: false, isSymbolicLink: false },
+			]),
+		);
+		const provider = new CombinedAutocompleteProvider([], baseDir);
+		const line = "@../outside/hss";
+
+		const result = await provider.getSuggestions([line], 0, line.length);
+
+		expect(result?.items.map(item => item.value)).toEqual(["@../outside/history-search.ts"]);
+		expect(fuzzyCalls).toBe(0);
+	});
+
+	it("returns null for malformed unsafe scopes instead of falling back to fuzzy recursion", async () => {
+		let fuzzyCalls = 0;
+		const outsideDir = path.join(rootDir, "outside");
+		fs.mkdirSync(outsideDir, { recursive: true });
+		fs.writeFileSync(path.join(outsideDir, "alpha.ts"), "export const alpha = true;\n");
+		vi.spyOn(nativeModule, "fuzzyFind").mockImplementation(async () => {
+			fuzzyCalls += 1;
+			return makeFuzzyFindResult([{ path: "recursive-escape.ts", isDirectory: false, score: 1 }]);
+		});
+		const provider = new CombinedAutocompleteProvider([], baseDir);
+		const line = "@../outside/missing/../alpha";
+
+		const result = await provider.getSuggestions([line], 0, line.length);
+
+		expect(result).toBeNull();
+		expect(fuzzyCalls).toBe(0);
+	});
+
+	it("returns null for malformed natural paths instead of normalizing through a missing segment", async () => {
+		const outsideDir = path.join(rootDir, "outside");
+		fs.mkdirSync(outsideDir, { recursive: true });
+		fs.writeFileSync(path.join(outsideDir, "alpha.ts"), "export const alpha = true;\n");
+		const provider = new CombinedAutocompleteProvider([], baseDir);
+		const prefix = "../outside/missing/../alpha";
+		const line = `open ${prefix}`;
+
+		const result = await provider.getSuggestions([line], 0, line.length);
+
+		expect(result).toBeNull();
+	});
+
+	it("returns null for file scopes instead of falling back to fuzzy recursion", async () => {
+		let fuzzyCalls = 0;
+		fs.writeFileSync(path.join(rootDir, "outside-file.ts"), "export const nope = true;\n");
+		vi.spyOn(nativeModule, "fuzzyFind").mockImplementation(async () => {
+			fuzzyCalls += 1;
+			return makeFuzzyFindResult([{ path: "recursive-escape.ts", isDirectory: false, score: 1 }]);
+		});
+		vi.spyOn(nativeModule, "readDirLimited").mockImplementation(async () => makeReadDirLimitedResult([]));
+		const provider = new CombinedAutocompleteProvider([], baseDir);
+		const line = "@../outside-file.ts/alpha";
+
+		const result = await provider.getSuggestions([line], 0, line.length);
+
+		expect(result).toBeNull();
+		expect(fuzzyCalls).toBe(0);
+	});
+
+	it("uses bounded native completion for Windows home-backslash prefixes", async () => {
+		let fuzzyCalls = 0;
+		vi.spyOn(nativeModule, "fuzzyFind").mockImplementation(async () => {
+			fuzzyCalls += 1;
+			return makeFuzzyFindResult([{ path: "recursive-home.ts", isDirectory: false, score: 1 }]);
+		});
+		vi.spyOn(nativeModule, "readDirLimited").mockImplementation(async () =>
+			makeReadDirLimitedResult([{ name: "Documents", isDirectory: true, isSymbolicLink: false }]),
+		);
+		const provider = new CombinedAutocompleteProvider([], baseDir);
+		const line = "@~\\Doc";
+
+		const result = await provider.getSuggestions([line], 0, line.length);
+
+		expect(result?.items.map(item => item.label)).toEqual(["Documents/"]);
+		expect(result?.items.map(item => item.value)).toEqual(["@~\\Documents\\"]);
+		expect(fuzzyCalls).toBe(0);
+	});
+
+	it("uses bounded native completion for Windows drive-letter prefixes", async () => {
+		let fuzzyCalls = 0;
+		vi.spyOn(nativeModule, "fuzzyFind").mockImplementation(async () => {
+			fuzzyCalls += 1;
+			return makeFuzzyFindResult([{ path: "recursive-drive.ts", isDirectory: false, score: 1 }]);
+		});
+		vi.spyOn(nativeModule, "readDirLimited").mockImplementation(async () =>
+			makeReadDirLimitedResult([{ name: "alpha.ts", isDirectory: false, isSymbolicLink: false }]),
+		);
+		const provider = new CombinedAutocompleteProvider([], baseDir);
+		const line = "@C:\\repo\\a";
+
+		const result = await provider.getSuggestions([line], 0, line.length);
+
+		expect(result?.items.map(item => item.label)).toEqual(["alpha.ts"]);
+		expect(fuzzyCalls).toBe(0);
+	});
+
+	it("preserves bare Windows drive-relative prefixes", async () => {
+		vi.spyOn(nativeModule, "fuzzyFind").mockImplementation(async () => makeFuzzyFindResult([]));
+		vi.spyOn(nativeModule, "readDirLimited").mockImplementation(async () =>
+			makeReadDirLimitedResult([{ name: "alpha.ts", isDirectory: false, isSymbolicLink: false }]),
+		);
+		const provider = new CombinedAutocompleteProvider([], baseDir);
+		const line = "@C:";
+
+		const result = await provider.getSuggestions([line], 0, line.length);
+
+		expect(result?.items.map(item => item.value)).toEqual(["@C:alpha.ts"]);
+	});
+
+	it("preserves typed backslashes for Windows drive-letter directory completions", async () => {
+		vi.spyOn(nativeModule, "fuzzyFind").mockImplementation(async () => makeFuzzyFindResult([]));
+		vi.spyOn(nativeModule, "readDirLimited").mockImplementation(async () =>
+			makeReadDirLimitedResult([{ name: "Documents", isDirectory: true, isSymbolicLink: false }]),
+		);
+		const provider = new CombinedAutocompleteProvider([], baseDir);
+		const line = "@C:\\repo\\Doc";
+
+		const result = await provider.getSuggestions([line], 0, line.length);
+
+		expect(result?.items.map(item => item.label)).toEqual(["Documents/"]);
+		expect(result?.items.map(item => item.value)).toEqual(["@C:\\repo\\Documents\\"]);
+	});
+
+	it("uses bounded native completion for Windows UNC prefixes", async () => {
+		let fuzzyCalls = 0;
+		vi.spyOn(nativeModule, "fuzzyFind").mockImplementation(async () => {
+			fuzzyCalls += 1;
+			return makeFuzzyFindResult([{ path: "recursive-unc.ts", isDirectory: false, score: 1 }]);
+		});
+		vi.spyOn(nativeModule, "readDirLimited").mockImplementation(async () =>
+			makeReadDirLimitedResult([{ name: "share.txt", isDirectory: false, isSymbolicLink: false }]),
+		);
+		const provider = new CombinedAutocompleteProvider([], baseDir);
+		const line = "@\\\\server\\share\\sh";
+
+		const result = await provider.getSuggestions([line], 0, line.length);
+
+		expect(result?.items.map(item => item.label)).toEqual(["share.txt"]);
+		expect(fuzzyCalls).toBe(0);
+	});
+
+	it("preserves bare Windows UNC share roots", async () => {
+		vi.spyOn(nativeModule, "fuzzyFind").mockImplementation(async () => makeFuzzyFindResult([]));
+		vi.spyOn(nativeModule, "readDirLimited").mockImplementation(async () =>
+			makeReadDirLimitedResult([{ name: "alpha.ts", isDirectory: false, isSymbolicLink: false }]),
+		);
+		const provider = new CombinedAutocompleteProvider([], baseDir);
+		const line = "@\\\\server\\share";
+
+		const result = await provider.getSuggestions([line], 0, line.length);
+
+		expect(result?.items.map(item => item.value)).toEqual(["@\\\\server\\share\\alpha.ts"]);
+	});
+
+	it("preserves bare forward-slash UNC share roots", async () => {
+		vi.spyOn(nativeModule, "fuzzyFind").mockImplementation(async () => makeFuzzyFindResult([]));
+		vi.spyOn(nativeModule, "readDirLimited").mockImplementation(async () =>
+			makeReadDirLimitedResult([{ name: "alpha.ts", isDirectory: false, isSymbolicLink: false }]),
+		);
+		const provider = new CombinedAutocompleteProvider([], baseDir);
+		const line = "@//server/share";
+
+		const result = await provider.getSuggestions([line], 0, line.length);
+
+		expect(result?.items.map(item => item.value)).toEqual(["@//server/share/alpha.ts"]);
+	});
+
+	it("preserves typed backslashes for Windows UNC directory completions", async () => {
+		vi.spyOn(nativeModule, "fuzzyFind").mockImplementation(async () => makeFuzzyFindResult([]));
+		vi.spyOn(nativeModule, "readDirLimited").mockImplementation(async () =>
+			makeReadDirLimitedResult([{ name: "Documents", isDirectory: true, isSymbolicLink: false }]),
+		);
+		const provider = new CombinedAutocompleteProvider([], baseDir);
+		const line = "@\\\\server\\share\\Doc";
+
+		const result = await provider.getSuggestions([line], 0, line.length);
+
+		expect(result?.items.map(item => item.label)).toEqual(["Documents/"]);
+		expect(result?.items.map(item => item.value)).toEqual(["@\\\\server\\share\\Documents\\"]);
+	});
+
+	it("shares one native enumeration for concurrent prefixes in the same directory", async () => {
+		const pending = Promise.withResolvers<MockReadDirLimitedResult>();
+		let readDirLimitedCalls = 0;
+		vi.spyOn(nativeModule, "fuzzyFind").mockImplementation(async () => makeFuzzyFindResult([]));
+		vi.spyOn(nativeModule, "readDirLimited").mockImplementation(async () => {
+			readDirLimitedCalls += 1;
+			return pending.promise;
+		});
+		const provider = new CombinedAutocompleteProvider([], baseDir);
+		const alphaLine = "@../outside/al";
+		const betaLine = "@../outside/bt";
+		const alphaPromise = provider.getSuggestions([alphaLine], 0, alphaLine.length);
+		const betaPromise = provider.getSuggestions([betaLine], 0, betaLine.length);
+
+		pending.resolve(
+			makeReadDirLimitedResult([
+				{ name: "alpha.ts", isDirectory: false, isSymbolicLink: false },
+				{ name: "beta.ts", isDirectory: false, isSymbolicLink: false },
+			]),
+		);
+		const [alphaResult, betaResult] = await Promise.all([alphaPromise, betaPromise]);
+
+		expect(readDirLimitedCalls).toBe(1);
+		expect(alphaResult?.items.map(item => item.value)).toEqual(["@../outside/alpha.ts"]);
+		expect(betaResult?.items.map(item => item.value)).toEqual(["@../outside/beta.ts"]);
+	});
+
+	it("reuses cached native directory results until the TTL expires", async () => {
+		let now = 1_000;
+		let readDirLimitedCalls = 0;
+		vi.spyOn(Date, "now").mockImplementation(() => now);
+		vi.spyOn(nativeModule, "fuzzyFind").mockImplementation(async () => makeFuzzyFindResult([]));
+		vi.spyOn(nativeModule, "readDirLimited").mockImplementation(async () => {
+			readDirLimitedCalls += 1;
+			return makeReadDirLimitedResult([{ name: "alpha.ts", isDirectory: false, isSymbolicLink: false }]);
+		});
+		const provider = new CombinedAutocompleteProvider([], baseDir);
+		const line = "@../outside/a";
+
+		await provider.getSuggestions([line], 0, line.length);
+		await provider.getSuggestions([line], 0, line.length);
+		now = 4_000;
+		await provider.getSuggestions([line], 0, line.length);
+
+		expect(readDirLimitedCalls).toBe(2);
+	});
+
+	it("does not dedupe or cache across bounded directory invalidation", async () => {
+		const first = Promise.withResolvers<MockReadDirLimitedResult>();
+		const second = Promise.withResolvers<MockReadDirLimitedResult>();
+		const outsideDir = path.join(rootDir, "outside");
+		fs.mkdirSync(outsideDir, { recursive: true });
+		let readDirLimitedCalls = 0;
+		vi.spyOn(nativeModule, "fuzzyFind").mockImplementation(async () => makeFuzzyFindResult([]));
+		vi.spyOn(nativeModule, "readDirLimited").mockImplementation(async () => {
+			readDirLimitedCalls += 1;
+			return readDirLimitedCalls === 1 ? first.promise : second.promise;
+		});
+		const provider = new CombinedAutocompleteProvider([], baseDir);
+		const line = "@../outside/a";
+
+		const firstRequest = provider.getSuggestions([line], 0, line.length);
+		await waitForAtLeastNumber(() => readDirLimitedCalls, 1);
+		provider.invalidateDirCache(outsideDir);
+		const secondRequest = provider.getSuggestions([line], 0, line.length);
+		await waitForAtLeastNumber(() => readDirLimitedCalls, 2);
+
+		first.resolve(makeReadDirLimitedResult([{ name: "alpha-old.ts", isDirectory: false, isSymbolicLink: false }]));
+		await firstRequest;
+		const thirdRequest = provider.getSuggestions([line], 0, line.length);
+		const callsWhileSecondPending = readDirLimitedCalls;
+		second.resolve(makeReadDirLimitedResult([{ name: "alpha-new.ts", isDirectory: false, isSymbolicLink: false }]));
+		const [, thirdResult] = await Promise.all([secondRequest, thirdRequest]);
+		const cachedResult = await provider.getSuggestions([line], 0, line.length);
+
+		expect(callsWhileSecondPending).toBe(2);
+		expect(readDirLimitedCalls).toBe(2);
+		expect(thirdResult?.items.map(item => item.value)).toEqual(["@../outside/alpha-new.ts"]);
+		expect(cachedResult?.items.map(item => item.value)).toEqual(["@../outside/alpha-new.ts"]);
+	});
+
+	it("fails closed when too many unsafe directory enumerations are pending", async () => {
+		let readDirLimitedCalls = 0;
+		const gate = Promise.withResolvers<void>();
+		for (let i = 0; i < 96; i += 1) {
+			fs.mkdirSync(path.join(rootDir, `outside-${i}`), { recursive: true });
+		}
+		vi.spyOn(nativeModule, "fuzzyFind").mockImplementation(async () => makeFuzzyFindResult([]));
+		vi.spyOn(nativeModule, "readDirLimited").mockImplementation(async () => {
+			readDirLimitedCalls += 1;
+			await gate.promise;
+			return makeReadDirLimitedResult([{ name: "alpha.ts", isDirectory: false, isSymbolicLink: false }]);
+		});
+		const provider = new CombinedAutocompleteProvider([], baseDir);
+		const requests = Array.from({ length: 96 }, (_, i) => {
+			const line = `@../outside-${i}/a`;
+			return provider.getSuggestions([line], 0, line.length);
+		});
+
+		await waitForAtLeastNumber(() => readDirLimitedCalls, 1);
+		await waitForStableNumber(() => readDirLimitedCalls);
+		gate.resolve();
+		const results = await Promise.all(requests);
+
+		expect(readDirLimitedCalls).toBe(1);
+		expect(results.some(result => result === null)).toBe(true);
+	});
+
+	it("keeps explicit Tab completion exhaustive after natural unsafe suggestions are capped", async () => {
+		for (const name of ["anchor.ts", "apple.ts", "apricot.ts", "atom.ts", "azure.ts"]) {
+			fs.writeFileSync(path.join(baseDir, name), "export const value = true;\n");
+		}
+		const prefix = `${baseDir}${path.sep}a`;
+		const line = `open ${prefix}`;
+		vi.spyOn(nativeModule, "fuzzyFind").mockImplementation(async () => makeFuzzyFindResult([]));
+		vi.spyOn(nativeModule, "readDirLimited").mockImplementation(async () =>
+			makeReadDirLimitedResult(
+				[
+					{ name: "anchor.ts", isDirectory: false, isSymbolicLink: false },
+					{ name: "apple.ts", isDirectory: false, isSymbolicLink: false },
+				],
+				true,
+			),
+		);
+		const provider = new CombinedAutocompleteProvider([], baseDir);
+
+		const natural = await provider.getSuggestions([line], 0, line.length);
+		const forced = await provider.getForceFileSuggestions([line], 0, line.length);
+
+		expect(natural?.items).toHaveLength(2);
+		expect(forced?.items.map(item => item.label)).toEqual([
+			"anchor.ts",
+			"apple.ts",
+			"apricot.ts",
+			"atom.ts",
+			"azure.ts",
+		]);
 	});
 });
