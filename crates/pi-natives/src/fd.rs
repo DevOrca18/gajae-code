@@ -702,6 +702,6 @@ mod tests {
 		})
 		.expect_err("invalid utf8 entry should fail");
 
-		assert_eq!(err.reason, INVALID_UTF8_ENTRY_REASON);
+		assert_eq!(err.reason, super::INVALID_UTF8_ENTRY_REASON);
 	}
 }
