@@ -89,7 +89,8 @@ fn read_dir_limited_sync(options: ReadDirLimitedOptions) -> Result<ReadDirLimite
 				.file_type()
 				.map_err(|err| io_error(err, "Failed to inspect directory entry type"))?;
 			let name = entry.file_name().into_string().map_err(|name| {
-				Error::from_reason(format!("Directory entry name is not valid UTF-8: {:?}", name))
+				let name = name.to_string_lossy();
+				Error::from_reason(format!("Directory entry name is not valid UTF-8: {name}"))
 			})?;
 			Ok(ReadDirLimitedEntry {
 				name,
