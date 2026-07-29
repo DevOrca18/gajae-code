@@ -427,7 +427,7 @@ describe("pi-natives", () => {
 
 		it("rejects a zero entry limit", async () => {
 			await expect(readDirLimited({ path: testDir, limit: 0 })).rejects.toThrow(
-				"readDirLimited requires `limit` to be greater than 0",
+				"readDirLimited requires `limit` to be an integer between 1 and 4294967295",
 			);
 		});
 
@@ -447,6 +447,17 @@ describe("pi-natives", () => {
 				expect(exact.truncated).toBe(false);
 			} finally {
 				await fs.rm(scopedDir, { recursive: true, force: true });
+			}
+		});
+
+		it("accepts the maximum u32 limit and rejects values outside the numeric contract", async () => {
+			const maximum = await readDirLimited({ path: testDir, limit: 0xffffffff });
+			expect(maximum.truncated).toBe(false);
+
+			for (const limit of [-1, 1.5, 0x1_0000_0000, Number.MAX_SAFE_INTEGER, Number.NaN, Number.POSITIVE_INFINITY]) {
+				await expect(readDirLimited({ path: testDir, limit })).rejects.toThrow(
+					"readDirLimited requires `limit` to be an integer between 1 and 4294967295",
+				);
 			}
 		});
 	});
@@ -499,7 +510,6 @@ describe("pi-natives", () => {
 				});
 				expect(restricted.matches.some(match => match.path.startsWith("linked-inside/"))).toBe(true);
 				expect(restricted.matches.some(match => match.path.startsWith("linked-outside/"))).toBe(false);
-
 				invalidateFsScanCache();
 				const restrictedFirst = await fuzzyFind({
 					query: "boundaryneedle",

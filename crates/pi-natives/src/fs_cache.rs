@@ -319,17 +319,28 @@ impl Drop for EntryVisitor<'_> {
 	}
 }
 
-fn resolves_outside_root(path: &Path, canonical_root: &Path) -> bool {
-	std::fs::canonicalize(path).is_ok_and(|target| !target.starts_with(canonical_root))
-}
-
-fn should_collect_stay_within_root_entry(path: &Path, canonical_root: &Path) -> bool {
-	if !resolves_outside_root(path, canonical_root) {
+#[cfg(windows)]
+fn is_link_or_reparse_point(path: &Path, path_is_symlink: bool) -> bool {
+	if path_is_symlink {
 		return true;
 	}
-	!path
-		.parent()
-		.is_some_and(|parent| resolves_outside_root(parent, canonical_root))
+	use std::os::windows::fs::MetadataExt;
+
+	const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+	std::fs::symlink_metadata(path)
+		.is_ok_and(|metadata| metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0)
+}
+
+#[cfg(not(windows))]
+const fn is_link_or_reparse_point(_path: &Path, path_is_symlink: bool) -> bool {
+	path_is_symlink
+}
+
+fn should_skip_external_link(path: &Path, path_is_symlink: bool, canonical_root: &Path) -> bool {
+	if !is_link_or_reparse_point(path, path_is_symlink) {
+		return false;
+	}
+	!std::fs::canonicalize(path).is_ok_and(|target| target.starts_with(canonical_root))
 }
 
 impl ParallelVisitor for EntryVisitor<'_> {
@@ -346,20 +357,16 @@ impl ParallelVisitor for EntryVisitor<'_> {
 		let Ok(entry) = entry else {
 			return WalkState::Continue;
 		};
-		let skip_external_entry = self
-			.canonical_root
-			.is_some_and(|canonical_root| resolves_outside_root(entry.path(), canonical_root));
-		let should_collect_entry = self.canonical_root.is_none_or(|canonical_root| {
-			should_collect_stay_within_root_entry(entry.path(), canonical_root)
+		let skip_external_entry = self.canonical_root.is_some_and(|canonical_root| {
+			should_skip_external_link(entry.path(), entry.path_is_symlink(), canonical_root)
 		});
-		if should_collect_entry && let Some(entry) = collect_entry(self.root, &entry, self.detail) {
+		if skip_external_entry {
+			return WalkState::Skip;
+		}
+		if let Some(entry) = collect_entry(self.root, &entry, self.detail) {
 			self.entries.push(entry);
 		}
-		if skip_external_entry {
-			WalkState::Skip
-		} else {
-			WalkState::Continue
-		}
+		WalkState::Continue
 	}
 }
 
@@ -647,6 +654,21 @@ mod tests {
 		}
 	}
 
+	fn create_directory_link(target: &Path, link: &Path) -> bool {
+		#[cfg(unix)]
+		{
+			std::os::unix::fs::symlink(target, link).is_ok()
+		}
+		#[cfg(windows)]
+		{
+			match std::os::windows::fs::symlink_dir(target, link) {
+				Ok(()) => true,
+				Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => false,
+				Err(err) => panic!("create windows directory link: {err}"),
+			}
+		}
+	}
+
 	#[cfg(unix)]
 	fn make_fifo(path: &Path) {
 		let fifo_path =
@@ -875,5 +897,88 @@ mod tests {
 			.expect("full scan includes file");
 		assert!(full_file.mtime.is_some(), "full scan should include mtime");
 		assert_eq!(full_file.size, Some(2.0));
+	}
+
+	#[test]
+	fn collect_entries_excludes_external_directory_links_when_staying_within_root() {
+		let root = TempDirGuard::new();
+		let outside = TempDirGuard::new();
+		let internal_target = root.path().join("internal-target");
+		fs::create_dir_all(internal_target.join("nested")).expect("create internal target");
+		fs::create_dir_all(outside.path().join("nested")).expect("create external target");
+		fs::write(internal_target.join("nested/inside.ts"), "inside").expect("write internal file");
+		fs::write(outside.path().join("nested/outside.ts"), "outside").expect("write external file");
+
+		if !create_directory_link(&internal_target, &root.path().join("linked-inside")) {
+			return;
+		}
+		if !create_directory_link(outside.path(), &root.path().join("linked-outside")) {
+			return;
+		}
+
+		let ct = crate::task::CancelToken::default();
+		let unrestricted = super::collect_entries(
+			root.path(),
+			super::ScanOptions {
+				include_hidden:    true,
+				use_gitignore:     false,
+				skip_node_modules: true,
+				follow_links:      true,
+				stay_within_root:  false,
+				detail:            super::ScanDetail::Minimal,
+			},
+			&ct,
+		)
+		.expect("unrestricted scan should succeed");
+		let unrestricted_paths: Vec<&str> = unrestricted
+			.iter()
+			.map(|entry| entry.path.as_str())
+			.collect();
+		assert!(
+			unrestricted_paths.contains(&"linked-outside"),
+			"unrestricted scan should retain the external link entry: {unrestricted_paths:?}"
+		);
+		assert!(
+			unrestricted_paths
+				.iter()
+				.any(|path| path.starts_with("linked-outside/")),
+			"unrestricted scan should traverse external descendants: {unrestricted_paths:?}"
+		);
+
+		let restricted = super::collect_entries(
+			root.path(),
+			super::ScanOptions {
+				include_hidden:    true,
+				use_gitignore:     false,
+				skip_node_modules: true,
+				follow_links:      true,
+				stay_within_root:  true,
+				detail:            super::ScanDetail::Minimal,
+			},
+			&ct,
+		)
+		.expect("restricted scan should succeed");
+		let restricted_paths: Vec<&str> =
+			restricted.iter().map(|entry| entry.path.as_str()).collect();
+		assert!(
+			restricted_paths.contains(&"linked-inside"),
+			"restricted scan should retain internal links: {restricted_paths:?}"
+		);
+		assert!(
+			restricted_paths
+				.iter()
+				.any(|path| path.starts_with("linked-inside/")),
+			"restricted scan should traverse internal descendants: {restricted_paths:?}"
+		);
+		assert!(
+			!restricted_paths.contains(&"linked-outside"),
+			"restricted scan should drop the external link entry itself: {restricted_paths:?}"
+		);
+		assert!(
+			!restricted_paths
+				.iter()
+				.any(|path| path.starts_with("linked-outside/")),
+			"restricted scan should drop external descendants: {restricted_paths:?}"
+		);
 	}
 }

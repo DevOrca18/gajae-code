@@ -18,8 +18,9 @@ use crate::{fs_cache, task};
 pub struct ReadDirLimitedOptions {
 	/// Directory to enumerate.
 	pub path:  String,
-	/// Maximum number of entries to return. Must be positive.
-	pub limit: u32,
+	/// Maximum number of entries to return. Must be an integer in the `u32`
+	/// range.
+	pub limit: f64,
 }
 
 /// A single filesystem entry returned by `readDirLimited`.
@@ -45,7 +46,9 @@ pub struct ReadDirLimitedResult {
 }
 
 fn invalid_limit_error() -> Error {
-	Error::from_reason("readDirLimited requires `limit` to be greater than 0".to_string())
+	Error::from_reason(
+		"readDirLimited requires `limit` to be an integer between 1 and 4294967295".to_string(),
+	)
 }
 
 fn io_error(err: std::io::Error, context: &str) -> Error {
@@ -70,18 +73,18 @@ where
 		}
 	}
 
-	match iter.next() {
-		Some(Ok(_)) => Ok((entries, true)),
-		Some(Err(err)) => Err(err),
-		None => Ok((entries, false)),
-	}
+	Ok((entries, iter.next().is_some()))
 }
 
 fn read_dir_limited_sync(options: ReadDirLimitedOptions) -> Result<ReadDirLimitedResult> {
-	let limit = usize::try_from(options.limit).map_err(|_| invalid_limit_error())?;
-	if limit == 0 {
+	if !options.limit.is_finite()
+		|| options.limit.fract() != 0.0
+		|| options.limit < 1.0
+		|| options.limit > f64::from(u32::MAX)
+	{
 		return Err(invalid_limit_error());
 	}
+	let limit = usize::try_from(options.limit as u32).map_err(|_| invalid_limit_error())?;
 
 	let direct_entries = fs::read_dir(&options.path)
 		.map_err(|err| io_error(err, "Failed to read directory"))?
@@ -409,8 +412,8 @@ mod tests {
 
 	fn read_dir_names(root: &Path, limit: u32) -> super::ReadDirLimitedResult {
 		read_dir_limited_sync(ReadDirLimitedOptions {
-			path: root.to_string_lossy().into_owned(),
-			limit,
+			path:  root.to_string_lossy().into_owned(),
+			limit: f64::from(limit),
 		})
 		.expect("readDirLimited should succeed")
 	}
@@ -437,15 +440,17 @@ mod tests {
 	}
 
 	#[test]
-	fn rejects_zero_limit() {
+	fn rejects_invalid_limits() {
 		let root = TempDir::new("pi-read-dir-limited");
-		let err = read_dir_limited_sync(ReadDirLimitedOptions {
-			path:  root.path().to_string_lossy().into_owned(),
-			limit: 0,
-		})
-		.expect_err("limit=0 should be rejected");
+		for limit in [0.0, -1.0, 1.5, f64::from(u32::MAX) + 1.0, f64::NAN, f64::INFINITY] {
+			let err = read_dir_limited_sync(ReadDirLimitedOptions {
+				path: root.path().to_string_lossy().into_owned(),
+				limit,
+			})
+			.expect_err("invalid limits should be rejected");
 
-		assert!(err.to_string().contains("limit"));
+			assert!(err.to_string().contains("integer between 1 and 4294967295"));
+		}
 	}
 
 	#[test]
@@ -553,7 +558,7 @@ mod tests {
 
 		let missing_error = read_dir_limited_sync(ReadDirLimitedOptions {
 			path:  missing.to_string_lossy().into_owned(),
-			limit: 1,
+			limit: 1.0,
 		})
 		.expect_err("missing path should fail");
 		assert!(
@@ -569,7 +574,7 @@ mod tests {
 
 		let file_error = read_dir_limited_sync(ReadDirLimitedOptions {
 			path:  file.to_string_lossy().into_owned(),
-			limit: 1,
+			limit: 1.0,
 		})
 		.expect_err("file path should fail");
 		assert!(file_error.to_string().contains("Failed to read directory"));
@@ -653,6 +658,33 @@ mod tests {
 		assert!(truncated);
 	}
 
+	#[test]
+	fn iterator_core_treats_a_lookahead_error_as_truncation() {
+		let values = [Ok::<_, &'static str>("alpha"), Err("lookahead read failed")];
+		let (values, truncated) = consume_limited_results(values.into_iter(), 1, Ok)
+			.expect("lookahead errors are not part of the page");
+
+		assert_eq!(values, vec!["alpha"]);
+		assert!(truncated);
+	}
+
+	#[test]
+	fn iterator_core_still_rejects_errors_inside_the_returned_page() {
+		let iterator_error = [Err::<&str, _>("page read failed")];
+		assert_eq!(
+			consume_limited_results(iterator_error.into_iter(), 1, Ok),
+			Err("page read failed")
+		);
+
+		let conversion_error = [Ok::<_, &'static str>("invalid")];
+		assert_eq!(
+			consume_limited_results(conversion_error.into_iter(), 1, |_| {
+				Err::<&str, _>("page conversion failed")
+			}),
+			Err("page conversion failed")
+		);
+	}
+
 	#[cfg(all(unix, not(target_os = "macos")))]
 	#[test]
 	fn invalid_utf8_entry_uses_a_fixed_error_message() {
@@ -664,7 +696,7 @@ mod tests {
 
 		let err = read_dir_limited_sync(ReadDirLimitedOptions {
 			path:  root.path().to_string_lossy().into_owned(),
-			limit: 1,
+			limit: 1.0,
 		})
 		.expect_err("invalid utf8 entry should fail");
 

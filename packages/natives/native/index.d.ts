@@ -474,6 +474,15 @@ export declare class Shell {
 export declare function __piNativesPublishOutcomeV1(): void
 
 /**
+ * Bounded-directory wire-contract sentinel.
+ *
+ * The loader requires this in addition to `readDirLimited` itself so a
+ * same-version addon built before strict numeric limit validation and
+ * lookahead-only truncation cannot satisfy the public JS contract.
+ */
+export declare function __piNativesReadDirLimitedV1(): void
+
+/**
  * Version sentinel — exists solely so the JS loader can prove at load time
  * that the `.node` file on disk is from the same package release as the
  * `index.js` ESM wrapper invoking it.
@@ -1989,7 +1998,10 @@ export interface ReadDirLimitedEntry {
 export interface ReadDirLimitedOptions {
   /** Directory to enumerate. */
   path: string
-  /** Maximum number of entries to return. Must be positive. */
+  /**
+   * Maximum number of entries to return. Must be an integer in the `u32`
+   * range.
+   */
   limit: number
 }
 

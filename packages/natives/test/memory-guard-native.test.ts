@@ -61,10 +61,28 @@ describe("probeWindowsJobMemory", () => {
 		).toThrow("probeWindowsJobMemory");
 	});
 
-	it("rejects stale same-version bindings without the bounded directory capability", () => {
+	it("rejects stale same-version bindings with the legacy bounded directory contract", () => {
 		const bindings = {
 			__piNativesVCurrent: () => undefined,
 			__piNativesPublishOutcomeV1: () => undefined,
+			renameNoReplacePath: () => undefined,
+			probeWindowsJobMemory: () => undefined,
+			readDirLimited: () => undefined,
+		};
+		expect(() =>
+			validateLoadedBindings(
+				{ versionSentinelExport: "__piNativesVCurrent", packageVersion: "current" },
+				bindings,
+				"cached-addon.node",
+			),
+		).toThrow("__piNativesReadDirLimitedV1");
+	});
+
+	it("rejects bindings that advertise the bounded directory contract without its implementation", () => {
+		const bindings = {
+			__piNativesVCurrent: () => undefined,
+			__piNativesPublishOutcomeV1: () => undefined,
+			__piNativesReadDirLimitedV1: () => undefined,
 			renameNoReplacePath: () => undefined,
 			probeWindowsJobMemory: () => undefined,
 		};

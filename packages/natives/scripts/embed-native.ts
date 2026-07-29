@@ -38,7 +38,12 @@ const stubContent = `
 export const embeddedAddon = null;
 `;
 
-const requiredAddonExports = ["nativeBuildInfo", "probeWindowsJobMemory", "readDirLimited"] as const;
+const requiredAddonExports = [
+	"nativeBuildInfo",
+	"probeWindowsJobMemory",
+	"__piNativesReadDirLimitedV1",
+	"readDirLimited",
+] as const;
 
 export function missingRequiredAddonExports(bindings: Record<string, unknown>): string[] {
 	return missingRequiredFunctions(bindings, requiredAddonExports);

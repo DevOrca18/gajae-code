@@ -183,6 +183,8 @@ const requiredGeneratedBindingSymbols = [
 	"repairOwnerOnlyPathSecurityExpected",
 	"verifyOwnerOnlyPathSecurityExpected",
 	"probeWindowsJobMemory",
+	"__piNativesReadDirLimitedV1",
+	"readDirLimited",
 ] as const;
 
 export function validateGeneratedBindingSource(bindings: string): void {

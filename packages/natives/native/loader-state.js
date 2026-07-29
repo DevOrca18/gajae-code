@@ -421,6 +421,12 @@ export function validateLoadedBindings(ctx, bindings, candidate) {
 	if (typeof bindings.probeWindowsJobMemory !== "function") {
 		throw new Error(`Loaded ${candidate} but it lacks required memory probe capability \`probeWindowsJobMemory\`.`);
 	}
+	if (typeof bindings.__piNativesReadDirLimitedV1 !== "function") {
+		throw new Error(
+			`Loaded ${candidate} but it lacks bounded-directory contract sentinel ` +
+				"`__piNativesReadDirLimitedV1`; trying the next compatible artifact.",
+		);
+	}
 	if (typeof bindings.readDirLimited !== "function") {
 		throw new Error(`Loaded ${candidate} but it lacks required bounded directory capability \`readDirLimited\`.`);
 	}

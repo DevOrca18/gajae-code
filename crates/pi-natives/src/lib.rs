@@ -86,3 +86,11 @@ pub const fn pi_natives_version_sentinel() {}
 /// cannot be selected over a compatible baseline.
 #[napi(js_name = "__piNativesPublishOutcomeV1")]
 pub const fn pi_natives_publish_outcome_sentinel() {}
+
+/// Bounded-directory wire-contract sentinel.
+///
+/// The loader requires this in addition to `readDirLimited` itself so a
+/// same-version addon built before strict numeric limit validation and
+/// lookahead-only truncation cannot satisfy the public JS contract.
+#[napi(js_name = "__piNativesReadDirLimitedV1")]
+pub const fn pi_natives_read_dir_limited_sentinel() {}
