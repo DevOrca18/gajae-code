@@ -4,7 +4,7 @@
 
 ### Fixed
 
-- File mention autocomplete now cancels superseded searches and completes absolute or home-relative paths one directory segment at a time, preventing broad recursive scans from exhausting memory while typing `@` paths.
+- File mention autocomplete now cancels superseded searches, keeps absolute/home `@` lookups and ancestor-escaping relative mentions on a bounded one-directory-segment path, and preserves literal absolute/home `Tab` paths while leaving forced `Tab` completion as the exhaustive immediate-directory escape hatch. Natural bounded lookup now inspects at most 100 immediate entries and exposes at most 20 suggestions, while explicit `Tab` remains exhaustive. This prevents broad recursive scans for those mention forms from exhausting memory without truncating explicit `Tab` completion.
 
 ## [0.12.0] - 2026-07-28
 

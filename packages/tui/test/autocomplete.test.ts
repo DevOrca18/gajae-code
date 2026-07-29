@@ -135,6 +135,242 @@ describe("CombinedAutocompleteProvider", () => {
 			expect(values.some(value => value.includes("alpha-local.ts"))).toBe(false);
 		});
 
+		it.each([
+			[
+				"project-child",
+				(_root: string, project: string): string => path.join(project, "linked-outside"),
+				"@linked-outside/anchor-a",
+				"@linked-outside/anchor-alpha.txt",
+				"@linked-outside/nested/anchor-alpha-deep.txt",
+			],
+			[
+				"sibling",
+				(root: string, _project: string): string => path.join(root, "sibling-link"),
+				"@../sibling-link/anchor-a",
+				"@../sibling-link/anchor-alpha.txt",
+				"@../sibling-link/nested/anchor-alpha-deep.txt",
+			],
+		] as const)("bounds %s relative symlink scopes that resolve outside the project", async (_name, linkPathFor, line, expectedValue, unexpectedNestedValue) => {
+			if (process.platform === "win32") {
+				return;
+			}
+
+			const externalTree = path.join(rootDir, "external-tree");
+			fs.mkdirSync(path.join(externalTree, "nested"), { recursive: true });
+			fs.writeFileSync(path.join(externalTree, "anchor-alpha.txt"), "anchor\n");
+			fs.writeFileSync(path.join(externalTree, "nested", "anchor-alpha-deep.txt"), "deep\n");
+			fs.symlinkSync(externalTree, linkPathFor(rootDir, baseDir), "dir");
+
+			const provider = new CombinedAutocompleteProvider([], baseDir);
+			const result = await provider.getSuggestions([line], 0, line.length);
+			const values = result?.items.map(item => item.value) ?? [];
+
+			expect(values).toContain(expectedValue);
+			expect(values).not.toContain(unexpectedNestedValue);
+		});
+
+		it("keeps recursive fuzzy discovery for relative symlinks that resolve inside the project", async () => {
+			if (process.platform === "win32") {
+				return;
+			}
+
+			const internalTree = path.join(baseDir, "internal-tree");
+			fs.mkdirSync(path.join(internalTree, "nested"), { recursive: true });
+			fs.writeFileSync(path.join(internalTree, "nested", "anchor-alpha-deep.txt"), "deep\n");
+			fs.symlinkSync(internalTree, path.join(baseDir, "linked-inside"), "dir");
+
+			const provider = new CombinedAutocompleteProvider([], baseDir);
+			const line = "@linked-inside/anchor-a";
+			const result = await provider.getSuggestions([line], 0, line.length);
+			const values = result?.items.map(item => item.value) ?? [];
+
+			expect(values).toContain("@linked-inside/nested/anchor-alpha-deep.txt");
+		});
+
+		it.each([
+			[
+				"unquoted ancestor escape",
+				(basePath: string): string => path.join(path.dirname(basePath), "project", "cwd"),
+				(basePath: string): string => path.dirname(basePath),
+				(_basePath: string): string => "@../ancestor-a",
+				"@../ancestor-alpha.txt",
+				"@../ancestor-nested/ancestor-alpha-deep.txt",
+			],
+			[
+				"quoted ancestor escape with spaces",
+				(basePath: string): string => path.join(path.dirname(basePath), "project"),
+				(_basePath: string): string => rootDir,
+				(_basePath: string): string => '@"sub dir/../../ancestor-a',
+				'@"sub dir/../../ancestor-alpha.txt"',
+				'@"sub dir/../../ancestor-nested/ancestor-alpha-deep.txt"',
+			],
+		] as const)("switches %s mentions to bounded immediate-directory lookup", async (_name, basePathFor, ancestorDirFor, lineFor, expectedValue, unexpectedNestedValue) => {
+			const projectBaseDir = basePathFor(baseDir);
+			const escapedRootDir = ancestorDirFor(projectBaseDir);
+			const escapedAncestor = path.join(escapedRootDir, "ancestor-alpha.txt");
+			const escapedNestedDir = path.join(escapedRootDir, "ancestor-nested");
+
+			fs.mkdirSync(projectBaseDir, { recursive: true });
+			fs.mkdirSync(path.join(projectBaseDir, "sub dir"), { recursive: true });
+			fs.mkdirSync(escapedNestedDir, { recursive: true });
+			fs.writeFileSync(escapedAncestor, "ancestor\n");
+			fs.writeFileSync(path.join(escapedNestedDir, "ancestor-alpha-deep.txt"), "deep\n");
+
+			const provider = new CombinedAutocompleteProvider([], projectBaseDir);
+			const line = lineFor(projectBaseDir);
+			const result = await provider.getSuggestions([line], 0, line.length);
+			const values = result?.items.map(item => item.value) ?? [];
+
+			expect(values).toContain(expectedValue);
+			expect(values).not.toContain(unexpectedNestedValue);
+			expect(values.some(value => value.includes("project"))).toBe(false);
+		});
+
+		it.each([
+			[
+				"unquoted ancestor escape",
+				(basePath: string): string => path.join(path.dirname(basePath), "project", "cwd"),
+				(basePath: string): string => path.dirname(basePath),
+				(_basePath: string): string => "@../ancestor-a",
+				(_basePath: string): string[] =>
+					Array.from({ length: 25 }, (_, index) => `@../ancestor-alpha-${index.toString().padStart(3, "0")}.txt`),
+				(_basePath: string): string => "@../ancestor-alpha-late.txt",
+				"@../ancestor-nested/ancestor-alpha-deep.txt",
+			],
+			[
+				"quoted ancestor escape with spaces",
+				(basePath: string): string => path.join(path.dirname(basePath), "project"),
+				(_basePath: string): string => rootDir,
+				(_basePath: string): string => '@"sub dir/../../ancestor-a',
+				(_basePath: string): string[] =>
+					Array.from(
+						{ length: 25 },
+						(_, index) => `@"sub dir/../../ancestor-alpha-${index.toString().padStart(3, "0")}.txt"`,
+					),
+				(_basePath: string): string => '@"sub dir/../../ancestor-alpha-late.txt"',
+				'@"sub dir/../../ancestor-nested/ancestor-alpha-deep.txt"',
+			],
+		] as const)("uses bounded opendir semantics for natural %s mentions", async (_name, basePathFor, ancestorDirFor, lineFor, expectedEarlyValuesFor, expectedLateValueFor, unexpectedNestedValue) => {
+			if (process.platform === "win32") {
+				return;
+			}
+
+			const projectBaseDir = basePathFor(baseDir);
+			const escapedRootDir = ancestorDirFor(projectBaseDir);
+			const escapedNestedDir = path.join(escapedRootDir, "ancestor-nested");
+			const entries: fs.Dirent[] = Array.from({ length: 150 }, (_, index) => {
+				const name =
+					index < 25
+						? `ancestor-alpha-${index.toString().padStart(3, "0")}.txt`
+						: index === 120
+							? "ancestor-alpha-late.txt"
+							: `filler-${index.toString().padStart(3, "0")}.txt`;
+				return {
+					name,
+					isDirectory: () => false,
+					isSymbolicLink: () => false,
+				} as fs.Dirent;
+			});
+			let iterated = 0;
+			let closed = false;
+			const readdirSpy = spyOn(fs.promises, "readdir").mockRejectedValue(
+				new Error("ancestor-bounded completion must not call readdir"),
+			);
+			const opendirSpy = spyOn(fs.promises, "opendir").mockResolvedValue({
+				async read() {
+					const entry = entries[iterated] ?? null;
+					iterated += entry ? 1 : 0;
+					return entry;
+				},
+				async close() {
+					closed = true;
+				},
+			} as fs.Dir);
+
+			try {
+				fs.mkdirSync(projectBaseDir, { recursive: true });
+				fs.mkdirSync(path.join(projectBaseDir, "sub dir"), { recursive: true });
+				fs.mkdirSync(escapedNestedDir, { recursive: true });
+				fs.writeFileSync(path.join(escapedNestedDir, "ancestor-alpha-deep.txt"), "deep\n");
+
+				const provider = new CombinedAutocompleteProvider([], projectBaseDir);
+				const line = lineFor(projectBaseDir);
+				const result = await provider.getSuggestions([line], 0, line.length);
+				const values = result?.items.map(item => item.value) ?? [];
+
+				expect(opendirSpy).toHaveBeenCalledTimes(1);
+				expect(readdirSpy).not.toHaveBeenCalled();
+				expect(iterated).toBeLessThanOrEqual(100);
+				expect(closed).toBe(true);
+				expect(values).toHaveLength(20);
+				for (const expectedEarlyValue of expectedEarlyValuesFor(projectBaseDir).slice(0, 20)) {
+					expect(values).toContain(expectedEarlyValue);
+				}
+				expect(values).not.toContain(expectedLateValueFor(projectBaseDir));
+				expect(values).not.toContain(unexpectedNestedValue);
+			} finally {
+				opendirSpy.mockRestore();
+				readdirSpy.mockRestore();
+			}
+		});
+
+		it.each([
+			[
+				"windows unquoted ancestor escape",
+				(basePath: string): string => path.join(path.dirname(basePath), "project", "cwd"),
+				(basePath: string): string => path.dirname(basePath),
+				(_basePath: string): string => "@..\\ancestor-a",
+				"@..\\ancestor-alpha.txt",
+				"@..\\ancestor-nested\\ancestor-alpha-deep.txt",
+			],
+			[
+				"windows quoted ancestor escape with spaces",
+				(basePath: string): string => path.join(path.dirname(basePath), "project"),
+				(_basePath: string): string => rootDir,
+				(_basePath: string): string => '@"sub dir\\..\\..\\ancestor-a',
+				'@"sub dir\\..\\..\\ancestor-alpha.txt"',
+				'@"sub dir\\..\\..\\ancestor-nested\\ancestor-alpha-deep.txt"',
+			],
+		] as const)("switches %s mentions to bounded immediate-directory lookup with backslash separators", async (_name, basePathFor, ancestorDirFor, lineFor, expectedValue, unexpectedNestedValue) => {
+			if (process.platform !== "win32") {
+				return;
+			}
+
+			const projectBaseDir = basePathFor(baseDir);
+			const escapedRootDir = ancestorDirFor(projectBaseDir);
+			const escapedAncestor = path.join(escapedRootDir, "ancestor-alpha.txt");
+			const escapedNestedDir = path.join(escapedRootDir, "ancestor-nested");
+
+			fs.mkdirSync(projectBaseDir, { recursive: true });
+			fs.mkdirSync(path.join(projectBaseDir, "sub dir"), { recursive: true });
+			fs.mkdirSync(escapedNestedDir, { recursive: true });
+			fs.writeFileSync(escapedAncestor, "ancestor\n");
+			fs.writeFileSync(path.join(escapedNestedDir, "ancestor-alpha-deep.txt"), "deep\n");
+
+			const provider = new CombinedAutocompleteProvider([], projectBaseDir);
+			const line = lineFor(projectBaseDir);
+			const result = await provider.getSuggestions([line], 0, line.length);
+			const values = result?.items.map(item => item.value) ?? [];
+
+			expect(values).toContain(expectedValue);
+			expect(values).not.toContain(unexpectedNestedValue);
+		});
+
+		it("treats ..-prefixed sibling names as descendants instead of ancestor escapes", async () => {
+			const dotDotSiblingDir = path.join(path.dirname(baseDir), "..fixtures");
+			fs.mkdirSync(dotDotSiblingDir, { recursive: true });
+			fs.writeFileSync(path.join(dotDotSiblingDir, "alpha-local.txt"), "alpha\n");
+			fs.writeFileSync(path.join(dotDotSiblingDir, "zeta.txt"), "zeta\n");
+
+			const provider = new CombinedAutocompleteProvider([], baseDir);
+			const line = "@../..fixtures/alp";
+			const result = await provider.getSuggestions([line], 0, line.length);
+			const values = result?.items.map(item => item.value) ?? [];
+
+			expect(values).toContain("@../..fixtures/alpha-local.txt");
+			expect(values).not.toContain("@../..fixtures/zeta.txt");
+		});
+
 		it("cancels while resolving a scoped fuzzy-search directory", async () => {
 			const directoryStats = await fs.promises.stat(outsideDir);
 			const statStarted = Promise.withResolvers<void>();
@@ -178,7 +414,9 @@ describe("CombinedAutocompleteProvider", () => {
 				fs.rmSync(mentionRoot, { recursive: true, force: true });
 			});
 
-			it.each([
+			const boundedEnumerationCases: Array<
+				[name: string, inputFor: (root: string) => string, expectedFor: (root: string) => string]
+			> = [
 				[
 					"absolute",
 					(root: string) => `@${path.join(root, "im")}`,
@@ -192,7 +430,11 @@ describe("CombinedAutocompleteProvider", () => {
 				["home root", (_root: string) => "@~", (_root: string) => "@~/immediate-target.txt"],
 				["home child", (_root: string) => "@~/im", (_root: string) => "@~/immediate-target.txt"],
 				["quoted home child", (_root: string) => '@"~/im', (_root: string) => '@"~/immediate-target.txt"'],
-			])("enumerates only one directory segment for %s mentions", async (_name, inputFor, expectedFor) => {
+			];
+
+			it.each(
+				boundedEnumerationCases,
+			)("enumerates only one directory segment for %s mentions", async (_name, inputFor, expectedFor) => {
 				const line = inputFor(mentionRoot);
 				const provider = new CombinedAutocompleteProvider([], baseDir, mentionRoot);
 				const result = await provider.getSuggestions([line], 0, line.length);
@@ -209,6 +451,157 @@ describe("CombinedAutocompleteProvider", () => {
 				const result = await provider.getSuggestions([line], 0, line.length);
 
 				expect(result?.items.map(item => item.value)).toContain("@~/Downloads/");
+			});
+
+			const boundedScanCases: Array<
+				[
+					name: string,
+					inputFor: (root: string) => string,
+					expectedEarlyValues: (root: string) => string[],
+					expectedLate: (root: string) => string,
+				]
+			> = [
+				[
+					"absolute",
+					(root: string) => `@${path.join(root, "mat")}`,
+					(root: string) =>
+						Array.from(
+							{ length: 25 },
+							(_, index) => `@${path.join(root, `match-${index.toString().padStart(3, "0")}.txt`)}`,
+						),
+					(root: string) => `@${path.join(root, "match-late.txt")}`,
+				],
+				[
+					"home",
+					(_root: string) => "@~/mat",
+					(_root: string) =>
+						Array.from({ length: 25 }, (_, index) => `@~/match-${index.toString().padStart(3, "0")}.txt`),
+					(_root: string) => "@~/match-late.txt",
+				],
+			];
+
+			it.each(
+				boundedScanCases,
+			)("avoids full readdir materialization and caps bounded %s scans", async (_name, inputFor, expectedEarlyValues, expectedLate) => {
+				const entries: fs.Dirent[] = Array.from({ length: 150 }, (_, index) => {
+					const name =
+						index < 25
+							? `match-${index.toString().padStart(3, "0")}.txt`
+							: index === 120
+								? "match-late.txt"
+								: `filler-${index.toString().padStart(3, "0")}.txt`;
+					return {
+						name,
+						isDirectory: () => false,
+						isSymbolicLink: () => false,
+					} as fs.Dirent;
+				});
+				let iterated = 0;
+				let closed = false;
+				const readdirSpy = spyOn(fs.promises, "readdir").mockRejectedValue(
+					new Error("bounded completion must not call readdir"),
+				);
+				const opendirSpy = spyOn(fs.promises, "opendir").mockResolvedValue({
+					async read() {
+						const entry = entries[iterated] ?? null;
+						iterated += entry ? 1 : 0;
+						return entry;
+					},
+					async close() {
+						closed = true;
+					},
+				} as fs.Dir);
+
+				try {
+					const provider = new CombinedAutocompleteProvider([], baseDir, mentionRoot);
+					const line = inputFor(mentionRoot);
+					const result = await provider.getSuggestions([line], 0, line.length);
+					const values = result?.items.map(item => item.value) ?? [];
+
+					expect(opendirSpy).toHaveBeenCalledTimes(1);
+					expect(readdirSpy).not.toHaveBeenCalled();
+					expect(iterated).toBeLessThanOrEqual(100);
+					expect(closed).toBe(true);
+					expect(values).toHaveLength(20);
+					for (const expectedEarly of expectedEarlyValues(mentionRoot).slice(0, 20)) {
+						expect(values).toContain(expectedEarly);
+					}
+					expect(values).not.toContain(expectedLate(mentionRoot));
+				} finally {
+					opendirSpy.mockRestore();
+					readdirSpy.mockRestore();
+				}
+			});
+
+			it.each([
+				[
+					"natural relative path",
+					"relative/lat",
+					(provider: CombinedAutocompleteProvider, line: string) =>
+						provider.getSuggestions([line], 0, line.length),
+					"relative/late-target.txt",
+				],
+				[
+					"forced generic path",
+					"./lat",
+					(provider: CombinedAutocompleteProvider, line: string) =>
+						provider.getForceFileSuggestions([line], 0, line.length),
+					"./late-target.txt",
+				],
+			] as const)("preserves full %s scans beyond 100 entries", async (_name, line, requestSuggestions, expectedValue) => {
+				const entries: fs.Dirent[] = Array.from({ length: 150 }, (_, index) => {
+					const name = index === 120 ? "late-target.txt" : `filler-${index.toString().padStart(3, "0")}.txt`;
+					return {
+						name,
+						isDirectory: () => false,
+						isSymbolicLink: () => false,
+					} as fs.Dirent;
+				});
+				const readdirSpy = spyOn(fs.promises, "readdir").mockResolvedValue(
+					entries as unknown as Awaited<ReturnType<typeof fs.promises.readdir>>,
+				);
+				const opendirSpy = spyOn(fs.promises, "opendir").mockRejectedValue(
+					new Error("generic relative completion should not use bounded opendir"),
+				);
+
+				try {
+					const provider = new CombinedAutocompleteProvider([], baseDir, mentionRoot);
+					const result = await requestSuggestions(provider, line);
+					const values = result?.items.map(item => item.value) ?? [];
+
+					expect(readdirSpy).toHaveBeenCalledTimes(1);
+					expect(opendirSpy).not.toHaveBeenCalled();
+					expect(values).toContain(expectedValue);
+				} finally {
+					readdirSpy.mockRestore();
+					opendirSpy.mockRestore();
+				}
+			});
+
+			it("keeps forced absolute Tab completion exhaustive beyond the 100-entry natural scan cap", async () => {
+				const entries: fs.Dirent[] = Array.from({ length: 150 }, (_, index) => {
+					const name = index === 120 ? "late-target.txt" : `filler-${index.toString().padStart(3, "0")}.txt`;
+					return {
+						name,
+						isDirectory: () => false,
+						isSymbolicLink: () => false,
+					} as fs.Dirent;
+				});
+				const readdirSpy = spyOn(fs.promises, "readdir").mockResolvedValue(
+					entries as unknown as Awaited<ReturnType<typeof fs.promises.readdir>>,
+				);
+
+				try {
+					const provider = new CombinedAutocompleteProvider([], baseDir, mentionRoot);
+					const line = `mention ${path.join(mentionRoot, "lat")}`;
+					const result = await provider.getForceFileSuggestions([line], 0, line.length);
+					const values = result?.items.map(item => item.value) ?? [];
+
+					expect(readdirSpy).toHaveBeenCalledTimes(1);
+					expect(values).toContain(`${path.join(mentionRoot, "late-target.txt")}`);
+				} finally {
+					readdirSpy.mockRestore();
+				}
 			});
 
 			it("keeps bounded directory completions inside the mention token", async () => {
@@ -261,10 +654,85 @@ describe("CombinedAutocompleteProvider", () => {
 				expect(await provider.getSuggestions([line], 0, line.length, controller.signal)).toBeNull();
 			});
 
-			it.each([
-				"regular",
-				"forced",
-			] as const)("cancels %s bounded path completion while directory enumeration is pending", async mode => {
+			it("cancels natural bounded path completion while opendir enumeration is pending", async () => {
+				const readStarted = Promise.withResolvers<void>();
+				const releaseRead = Promise.withResolvers<void>();
+				const opendirSpy = spyOn(fs.promises, "opendir").mockResolvedValue({
+					async read() {
+						readStarted.resolve();
+						await releaseRead.promise;
+						return null;
+					},
+					async close() {},
+				} as fs.Dir);
+				const readdirSpy = spyOn(fs.promises, "readdir").mockRejectedValue(
+					new Error("bounded completion should not use readdir"),
+				);
+				const provider = new CombinedAutocompleteProvider([], mentionRoot, mentionRoot);
+				const line = `@${path.join(mentionRoot, "im")}`;
+				const controller = new AbortController();
+				const pending = provider.getSuggestions([line], 0, line.length, controller.signal);
+
+				try {
+					await readStarted.promise;
+					controller.abort();
+					const timeout = Symbol("timeout");
+					const outcome = await Promise.race([pending, Bun.sleep(100).then(() => timeout)]);
+
+					expect(opendirSpy).toHaveBeenCalledTimes(1);
+					expect(readdirSpy).not.toHaveBeenCalled();
+					expect(outcome).not.toBe(timeout);
+					expect(outcome).toBeNull();
+				} finally {
+					releaseRead.resolve();
+					opendirSpy.mockRestore();
+					readdirSpy.mockRestore();
+					await pending.catch(() => null);
+				}
+			});
+
+			it("closes a bounded directory handle that opens after cancellation", async () => {
+				const openStarted = Promise.withResolvers<void>();
+				const opened = Promise.withResolvers<fs.Dir>();
+				let closeCalls = 0;
+				const lateDir = {
+					async read() {
+						return null;
+					},
+					async close() {
+						closeCalls += 1;
+					},
+				} as fs.Dir;
+				const opendirSpy = spyOn(fs.promises, "opendir").mockImplementation(() => {
+					openStarted.resolve();
+					return opened.promise;
+				});
+				const provider = new CombinedAutocompleteProvider([], mentionRoot, mentionRoot);
+				const line = `@${path.join(mentionRoot, "im")}`;
+				const controller = new AbortController();
+				const pending = provider.getSuggestions([line], 0, line.length, controller.signal);
+
+				try {
+					await openStarted.promise;
+					controller.abort();
+					const timeout = Symbol("timeout");
+					const outcome = await Promise.race([pending, Bun.sleep(100).then(() => timeout)]);
+
+					expect(outcome).not.toBe(timeout);
+					expect(outcome).toBeNull();
+
+					opened.resolve(lateDir);
+					await Bun.sleep(0);
+
+					expect(closeCalls).toBe(1);
+				} finally {
+					opened.resolve(lateDir);
+					opendirSpy.mockRestore();
+					await pending.catch(() => null);
+				}
+			});
+
+			it("cancels forced generic path completion while full readdir is pending", async () => {
 				const readdirStarted = Promise.withResolvers<void>();
 				const releaseReaddir = Promise.withResolvers<void>();
 				const readdirSpy = spyOn(fs.promises, "readdir").mockImplementation(async () => {
@@ -272,14 +740,13 @@ describe("CombinedAutocompleteProvider", () => {
 					await releaseReaddir.promise;
 					return [];
 				});
+				const opendirSpy = spyOn(fs.promises, "opendir").mockRejectedValue(
+					new Error("forced generic completion should not use bounded opendir"),
+				);
 				const provider = new CombinedAutocompleteProvider([], mentionRoot, mentionRoot);
-				const line =
-					mode === "regular" ? `@${path.join(mentionRoot, "im")}` : `mention ${path.join(mentionRoot, "im")}`;
+				const line = `mention ${path.join(mentionRoot, "im")}`;
 				const controller = new AbortController();
-				const pending =
-					mode === "regular"
-						? provider.getSuggestions([line], 0, line.length, controller.signal)
-						: provider.getForceFileSuggestions([line], 0, line.length, controller.signal);
+				const pending = provider.getForceFileSuggestions([line], 0, line.length, controller.signal);
 
 				try {
 					await readdirStarted.promise;
@@ -287,12 +754,234 @@ describe("CombinedAutocompleteProvider", () => {
 					const timeout = Symbol("timeout");
 					const outcome = await Promise.race([pending, Bun.sleep(100).then(() => timeout)]);
 
+					expect(readdirSpy).toHaveBeenCalledTimes(1);
+					expect(opendirSpy).not.toHaveBeenCalled();
 					expect(outcome).not.toBe(timeout);
 					expect(outcome).toBeNull();
 				} finally {
 					releaseReaddir.resolve();
 					readdirSpy.mockRestore();
+					opendirSpy.mockRestore();
 					await pending.catch(() => null);
+				}
+			});
+
+			const literalSymlinkCases: Array<
+				[
+					name: string,
+					typedDirFor: (root: string) => string,
+					expectedFor: (root: string, typedDir: string) => string,
+				]
+			> = [
+				[
+					"absolute",
+					(root: string) => `${path.join(root, "link")}/../`,
+					(_root: string, typedDir: string) => `@${typedDir}candidate.txt`,
+				],
+				["home", (_root: string) => "~/link/../", (_root: string, typedDir: string) => `@${typedDir}candidate.txt`],
+			];
+
+			it.each(
+				literalSymlinkCases,
+			)("preserves literal %s symlink-plus-dotdot display paths", async (_name, typedDirFor, expectedFor) => {
+				if (process.platform === "win32") {
+					return;
+				}
+
+				fs.mkdirSync(path.join(mentionRoot, "real-parent", "child"), { recursive: true });
+				fs.writeFileSync(path.join(mentionRoot, "real-parent", "candidate.txt"), "candidate\n");
+				fs.symlinkSync(path.join(mentionRoot, "real-parent", "child"), path.join(mentionRoot, "link"), "dir");
+
+				const provider = new CombinedAutocompleteProvider([], baseDir, mentionRoot);
+				const typedDir = typedDirFor(mentionRoot);
+				const line = `@${typedDir}ca`;
+				const result = await provider.getSuggestions([line], 0, line.length);
+				const values = result?.items.map(item => item.value) ?? [];
+
+				expect(values).toContain(expectedFor(mentionRoot, typedDir));
+			});
+
+			it.each(
+				literalSymlinkCases,
+			)("preserves literal %s symlink-plus-dotdot display paths for forced completion", async (_name, typedDirFor, expectedFor) => {
+				if (process.platform === "win32") {
+					return;
+				}
+
+				fs.mkdirSync(path.join(mentionRoot, "real-parent", "child"), { recursive: true });
+				fs.writeFileSync(path.join(mentionRoot, "real-parent", "candidate.txt"), "candidate\n");
+				fs.symlinkSync(path.join(mentionRoot, "real-parent", "child"), path.join(mentionRoot, "link"), "dir");
+
+				const provider = new CombinedAutocompleteProvider([], baseDir, mentionRoot);
+				const typedDir = typedDirFor(mentionRoot);
+				const line = `mention ${typedDir}ca`;
+				const result = await provider.getForceFileSuggestions([line], 0, line.length);
+				const values = result?.items.map(item => item.value) ?? [];
+
+				expect(values).toContain(expectedFor(mentionRoot, typedDir).slice(1));
+			});
+
+			const missingSegmentSymlinkCases: Array<[name: string, typedDirFor: (root: string) => string]> = [
+				["absolute", (root: string) => `${path.join(root, "link")}/missing/../`],
+				["home", (_root: string) => "~/link/missing/../"],
+			];
+
+			it.each(
+				missingSegmentSymlinkCases,
+			)("does not collapse missing segments after a resolved %s symlink in natural mentions", async (_name, typedDirFor) => {
+				if (process.platform === "win32") {
+					return;
+				}
+
+				fs.mkdirSync(path.join(mentionRoot, "real-parent", "child"), { recursive: true });
+				fs.writeFileSync(path.join(mentionRoot, "real-parent", "child", "candidate.txt"), "candidate\n");
+				fs.symlinkSync(path.join(mentionRoot, "real-parent", "child"), path.join(mentionRoot, "link"), "dir");
+
+				const provider = new CombinedAutocompleteProvider([], baseDir, mentionRoot);
+				const line = `@${typedDirFor(mentionRoot)}ca`;
+				const result = await provider.getSuggestions([line], 0, line.length);
+
+				expect(result).toBeNull();
+			});
+
+			it.each(
+				missingSegmentSymlinkCases,
+			)("does not collapse missing segments after a resolved %s symlink in forced completion", async (_name, typedDirFor) => {
+				if (process.platform === "win32") {
+					return;
+				}
+
+				fs.mkdirSync(path.join(mentionRoot, "real-parent", "child"), { recursive: true });
+				fs.writeFileSync(path.join(mentionRoot, "real-parent", "child", "candidate.txt"), "candidate\n");
+				fs.symlinkSync(path.join(mentionRoot, "real-parent", "child"), path.join(mentionRoot, "link"), "dir");
+
+				const provider = new CombinedAutocompleteProvider([], baseDir, mentionRoot);
+				const line = `mention ${typedDirFor(mentionRoot)}ca`;
+				const result = await provider.getForceFileSuggestions([line], 0, line.length);
+
+				expect(result).toBeNull();
+			});
+
+			const nonDirectoryDotDotCases: Array<
+				[name: string, setup: (root: string) => void, typedDirFor: (root: string) => string]
+			> = [
+				[
+					"absolute regular file",
+					(root: string) => {
+						fs.writeFileSync(path.join(root, "plain.txt"), "plain\n");
+					},
+					(root: string) => `${path.join(root, "plain.txt")}/../`,
+				],
+				[
+					"home regular file",
+					(root: string) => {
+						fs.writeFileSync(path.join(root, "plain.txt"), "plain\n");
+					},
+					(_root: string) => "~/plain.txt/../",
+				],
+				[
+					"absolute symlink to file",
+					(root: string) => {
+						fs.writeFileSync(path.join(root, "plain.txt"), "plain\n");
+						fs.symlinkSync(path.join(root, "plain.txt"), path.join(root, "file-link"), "file");
+					},
+					(root: string) => `${path.join(root, "file-link")}/../`,
+				],
+				[
+					"home symlink to file",
+					(root: string) => {
+						fs.writeFileSync(path.join(root, "plain.txt"), "plain\n");
+						fs.symlinkSync(path.join(root, "plain.txt"), path.join(root, "file-link"), "file");
+					},
+					(_root: string) => "~/file-link/../",
+				],
+			];
+
+			it.each(
+				nonDirectoryDotDotCases,
+			)("treats %s as non-traversable in natural mentions", async (_name, setup, typedDirFor) => {
+				if (process.platform === "win32") {
+					return;
+				}
+
+				setup(mentionRoot);
+				const provider = new CombinedAutocompleteProvider([], baseDir, mentionRoot);
+				const line = `@${typedDirFor(mentionRoot)}ca`;
+				const result = await provider.getSuggestions([line], 0, line.length);
+
+				expect(result).toBeNull();
+			});
+
+			it.each(
+				nonDirectoryDotDotCases,
+			)("treats %s as non-traversable in forced completion", async (_name, setup, typedDirFor) => {
+				if (process.platform === "win32") {
+					return;
+				}
+
+				setup(mentionRoot);
+				const provider = new CombinedAutocompleteProvider([], baseDir, mentionRoot);
+				const line = `mention ${typedDirFor(mentionRoot)}ca`;
+				const result = await provider.getForceFileSuggestions([line], 0, line.length);
+
+				expect(result).toBeNull();
+			});
+
+			const relativeDotDotRequestCases = [
+				[
+					"natural mentions",
+					(provider: CombinedAutocompleteProvider, line: string) =>
+						provider.getSuggestions([line], 0, line.length),
+					(pathPrefix: string) => `@${pathPrefix}`,
+					(pathPrefix: string) => `@${pathPrefix}`,
+				],
+				[
+					"forced completion",
+					(provider: CombinedAutocompleteProvider, line: string) =>
+						provider.getForceFileSuggestions([line], 0, line.length),
+					(pathPrefix: string) => `mention ${pathPrefix}`,
+					(pathPrefix: string) => pathPrefix,
+				],
+			] as const;
+
+			it.each(
+				relativeDotDotRequestCases,
+			)("preserves relative directory-symlink-plus-dotdot semantics for %s", async (_name, request, lineFor, valueFor) => {
+				if (process.platform === "win32") {
+					return;
+				}
+
+				fs.mkdirSync(path.join(baseDir, "relative-parent", "child"), { recursive: true });
+				fs.writeFileSync(path.join(baseDir, "relative-parent", "candidate.txt"), "candidate\n");
+				fs.symlinkSync(path.join(baseDir, "relative-parent", "child"), path.join(baseDir, "relative-link"), "dir");
+
+				const provider = new CombinedAutocompleteProvider([], baseDir, mentionRoot);
+				const typedPrefix = "relative-link/../ca";
+				const result = await request(provider, lineFor(typedPrefix));
+				const values = result?.items.map(item => item.value) ?? [];
+
+				expect(values).toContain(valueFor("relative-link/../candidate.txt"));
+			});
+
+			it.each(
+				relativeDotDotRequestCases,
+			)("preserves relative ENOENT and ENOTDIR boundaries for %s", async (_name, request, lineFor, _valueFor) => {
+				if (process.platform === "win32") {
+					return;
+				}
+
+				fs.mkdirSync(path.join(baseDir, "relative-parent", "child"), { recursive: true });
+				fs.writeFileSync(path.join(baseDir, "relative-parent", "child", "candidate.txt"), "candidate\n");
+				fs.symlinkSync(path.join(baseDir, "relative-parent", "child"), path.join(baseDir, "relative-link"), "dir");
+				fs.writeFileSync(path.join(baseDir, "candidate.txt"), "candidate\n");
+				fs.writeFileSync(path.join(baseDir, "plain.txt"), "plain\n");
+				fs.symlinkSync(path.join(baseDir, "plain.txt"), path.join(baseDir, "file-link"), "file");
+
+				for (const typedPrefix of ["relative-link/missing/../ca", "plain.txt/../ca", "file-link/../ca"]) {
+					const provider = new CombinedAutocompleteProvider([], baseDir, mentionRoot);
+					const result = await request(provider, lineFor(typedPrefix));
+
+					expect(result).toBeNull();
 				}
 			});
 		});
