@@ -96,6 +96,15 @@ describe.skipIf(!isWindows)("CombinedAutocompleteProvider Windows path regressio
 		expect(result?.items.map(item => item.value)).toContain(`@${path.win32.join(baseDir, "Documents")}\\`);
 	});
 
+	it("preserves the typed backslash form for recursive project-relative directory completions", async () => {
+		fs.mkdirSync(path.join(baseDir, "src", "Documents"), { recursive: true });
+		const line = "@src\\Doc";
+
+		const result = await provider.getSuggestions([line], 0, line.length);
+
+		expect(result?.items.map(item => item.value)).toContain("@src\\Documents\\");
+	});
+
 	it("limits junction suggestions to direct entries", async () => {
 		fs.writeFileSync(path.join(outsideDir, "alpha.ts"), "export const alpha = true;\n");
 		fs.mkdirSync(path.join(outsideDir, "nested"), { recursive: true });

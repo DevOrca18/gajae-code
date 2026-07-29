@@ -430,6 +430,25 @@ describe("pi-natives", () => {
 				"readDirLimited requires `limit` to be greater than 0",
 			);
 		});
+
+		it("reports truncation when the limit is one and keeps exact-limit scans complete", async () => {
+			const scopedDir = await fs.mkdtemp(path.join(os.tmpdir(), "natives-read-dir-bounds-"));
+			try {
+				for (const name of ["alpha.ts", "beta.ts"]) {
+					await fs.writeFile(path.join(scopedDir, name), "export const value = true;\n");
+				}
+
+				const truncated = await readDirLimited({ path: scopedDir, limit: 1 });
+				expect(truncated.entries).toHaveLength(1);
+				expect(truncated.truncated).toBe(true);
+
+				const exact = await readDirLimited({ path: scopedDir, limit: 2 });
+				expect(exact.entries).toHaveLength(2);
+				expect(exact.truncated).toBe(false);
+			} finally {
+				await fs.rm(scopedDir, { recursive: true, force: true });
+			}
+		});
 	});
 	describe("fuzzyFind", () => {
 		it("should match abbreviated fuzzy queries across separators", async () => {
@@ -480,6 +499,50 @@ describe("pi-natives", () => {
 				});
 				expect(restricted.matches.some(match => match.path.startsWith("linked-inside/"))).toBe(true);
 				expect(restricted.matches.some(match => match.path.startsWith("linked-outside/"))).toBe(false);
+
+				invalidateFsScanCache();
+				const restrictedFirst = await fuzzyFind({
+					query: "boundaryneedle",
+					path: root,
+					hidden: true,
+					gitignore: false,
+					cache: true,
+					stayWithinRoot: true,
+					maxResults: 100,
+				});
+				const unrestrictedSecond = await fuzzyFind({
+					query: "boundaryneedle",
+					path: root,
+					hidden: true,
+					gitignore: false,
+					cache: true,
+					maxResults: 100,
+				});
+				expect(restrictedFirst.matches.some(match => match.path.startsWith("linked-outside/"))).toBe(false);
+				expect(unrestrictedSecond.matches.some(match => match.path.startsWith("linked-outside/"))).toBe(true);
+
+				invalidateFsScanCache();
+				const [restrictedConcurrent, unrestrictedConcurrent] = await Promise.all([
+					fuzzyFind({
+						query: "boundaryneedle",
+						path: root,
+						hidden: true,
+						gitignore: false,
+						cache: true,
+						stayWithinRoot: true,
+						maxResults: 100,
+					}),
+					fuzzyFind({
+						query: "boundaryneedle",
+						path: root,
+						hidden: true,
+						gitignore: false,
+						cache: true,
+						maxResults: 100,
+					}),
+				]);
+				expect(restrictedConcurrent.matches.some(match => match.path.startsWith("linked-outside/"))).toBe(false);
+				expect(unrestrictedConcurrent.matches.some(match => match.path.startsWith("linked-outside/"))).toBe(true);
 			} finally {
 				invalidateFsScanCache();
 				await fs.rm(root, { recursive: true, force: true });
