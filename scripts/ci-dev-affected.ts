@@ -429,6 +429,23 @@ export function needsWindowsSessionPathRegression(paths: readonly string[]): boo
 	return paths.some(isWindowsSessionPathRegressionPath);
 }
 
+// Paths that need an exact-head Windows addon build plus live temp-dir/junction
+// autocomplete proof. The hosted Windows runner is the only place we can verify
+// drive-letter, home-backslash, and junction behavior against a real win32 addon.
+export function isWindowsAutocompletePathRegressionPath(changedPath: string): boolean {
+	return changedPath === "packages/tui/src/autocomplete.ts" ||
+		changedPath === "packages/tui/test/autocomplete.test.ts" ||
+		changedPath === "packages/tui/test/autocomplete.windows.test.ts" ||
+		changedPath === "crates/pi-natives/src/fd.rs" ||
+		changedPath === "crates/pi-natives/src/fs_cache.rs" ||
+		changedPath === "packages/natives/native/index.d.ts" ||
+		changedPath === "packages/natives/native/index.js";
+}
+
+export function needsWindowsAutocompletePathRegression(paths: readonly string[]): boolean {
+	return paths.some(isWindowsAutocompletePathRegressionPath);
+}
+
 // Main CI full mode: emit a lean matrix from the deterministic full plan. It
 // deliberately skips the dev source-sha/checkout asserts, the canonical plan
 // artifact, plan digest, and the Darwin smoke flag — Main CI re-derives the same
@@ -485,6 +502,7 @@ async function emitMatrix(): Promise<void> {
 	const hasPython = tasks.some(task => task.phase === "python");
 	const hasDarwinArm64TabWorkerSmoke = needsDarwinArm64TabWorkerSmoke(paths);
 	const hasWindowsSessionPath = needsWindowsSessionPathRegression(paths);
+	const hasWindowsAutocompletePath = needsWindowsAutocompletePathRegression(paths);
 	const lines = [
 		`matrix=${JSON.stringify({ include: shards })}`,
 		`has_tasks=${shards.length > 0}`,
@@ -492,6 +510,7 @@ async function emitMatrix(): Promise<void> {
 		`has_python=${hasPython}`,
 		`has_darwin_arm64_tab_worker_smoke=${hasDarwinArm64TabWorkerSmoke}`,
 		`has_windows_session_path=${hasWindowsSessionPath}`,
+		`has_windows_autocomplete_path=${hasWindowsAutocompletePath}`,
 		`plan_digest=${digest}`,
 		`plan_source_sha=${sourceSha}`,
 		`plan_mode=${mode}`,
@@ -1496,6 +1515,8 @@ export interface AffectedAggregateResults {
 	python: string;
 	windowsDoctor: string;
 	windowsDoctorRequired: string;
+	windowsAutocompletePath: string;
+	windowsAutocompletePathRequired: string;
 	windowsNativeToolchain: string;
 	windowsNativeToolchainRequired: string;
 	telegramGuard: string;
@@ -1519,6 +1540,8 @@ export function validateAffectedAggregate(results: AffectedAggregateResults): vo
 	if (results.python !== (results.hasPython === "true" ? "success" : "skipped")) throw new Error(results.hasPython === "true" ? "required Python matrix did not succeed" : "unplanned Python matrix was not skipped");
 	if (results.windowsDoctorRequired !== "true" && results.windowsDoctorRequired !== "false") throw new Error(`planner emitted invalid windows_doctor_required=${results.windowsDoctorRequired}`);
 	if (results.windowsDoctor !== (results.windowsDoctorRequired === "true" ? "success" : "skipped")) throw new Error(results.windowsDoctorRequired === "true" ? "required Windows dev:doctor did not succeed" : "unplanned Windows dev:doctor was not skipped");
+	if (results.windowsAutocompletePathRequired !== "true" && results.windowsAutocompletePathRequired !== "false") throw new Error(`planner emitted invalid windows_autocomplete_path_required=${results.windowsAutocompletePathRequired}`);
+	if (results.windowsAutocompletePath !== (results.windowsAutocompletePathRequired === "true" ? "success" : "skipped")) throw new Error(results.windowsAutocompletePathRequired === "true" ? "required Windows autocomplete path regression did not succeed" : "unplanned Windows autocomplete path regression was not skipped");
 	if (results.windowsNativeToolchainRequired !== "true" && results.windowsNativeToolchainRequired !== "false") throw new Error(`planner emitted invalid windows_native_toolchain_required=${results.windowsNativeToolchainRequired}`);
 	if (results.windowsNativeToolchain !== (results.windowsNativeToolchainRequired === "true" ? "success" : "skipped")) throw new Error(results.windowsNativeToolchainRequired === "true" ? "required Windows native build toolchain check did not succeed" : "unplanned Windows native build toolchain check was not skipped");
 	if (results.darwinArm64TabWorkerSmokeRequired !== "true" && results.darwinArm64TabWorkerSmokeRequired !== "false") throw new Error(`planner emitted invalid darwin_arm64_tab_worker_smoke_required=${results.darwinArm64TabWorkerSmokeRequired}`);
@@ -1537,6 +1560,8 @@ async function validateAggregate(): Promise<void> {
 		python: Bun.env.CI_DEV_PYTHON_RESULT?.trim() || "",
 		windowsDoctor: Bun.env.CI_DEV_WINDOWS_DOCTOR_RESULT?.trim() || "",
 		windowsDoctorRequired: Bun.env.CI_DEV_WINDOWS_DOCTOR_REQUIRED?.trim() || "",
+		windowsAutocompletePath: Bun.env.CI_DEV_WINDOWS_AUTOCOMPLETE_PATH_RESULT?.trim() || "",
+		windowsAutocompletePathRequired: Bun.env.CI_DEV_WINDOWS_AUTOCOMPLETE_PATH_REQUIRED?.trim() || "",
 		windowsNativeToolchain: Bun.env.CI_DEV_WINDOWS_NATIVE_TOOLCHAIN_RESULT?.trim() || "",
 		windowsNativeToolchainRequired: Bun.env.CI_DEV_WINDOWS_NATIVE_TOOLCHAIN_REQUIRED?.trim() || "",
 		telegramGuard: Bun.env.CI_DEV_TELEGRAM_GUARD_RESULT?.trim() || "",
@@ -1560,6 +1585,8 @@ async function validateAggregate(): Promise<void> {
 	console.log(`planned Python work: ${results.hasPython}`);
 	console.log(`windows-dev-doctor: ${results.windowsDoctor}`);
 	console.log(`planned Windows dev:doctor: ${results.windowsDoctorRequired}`);
+	console.log(`windows-autocomplete-path: ${results.windowsAutocompletePath}`);
+	console.log(`planned Windows autocomplete path regression: ${results.windowsAutocompletePathRequired}`);
 	console.log(`windows-native-build-toolchain: ${results.windowsNativeToolchain}`);
 	console.log(`planned Windows native build toolchain: ${results.windowsNativeToolchainRequired}`);
 	console.log(`darwin-arm64 tab-worker smoke: ${results.darwinArm64TabWorkerSmoke}`);
@@ -1654,6 +1681,8 @@ function aggregateFromEnv(): AffectedAggregateResults {
 		python: requiredEnv("CI_DEV_PYTHON_RESULT"),
 		windowsDoctor: requiredEnv("CI_DEV_WINDOWS_DOCTOR_RESULT"),
 		windowsDoctorRequired: requiredEnv("CI_DEV_WINDOWS_DOCTOR_REQUIRED"),
+		windowsAutocompletePath: requiredEnv("CI_DEV_WINDOWS_AUTOCOMPLETE_PATH_RESULT"),
+		windowsAutocompletePathRequired: requiredEnv("CI_DEV_WINDOWS_AUTOCOMPLETE_PATH_REQUIRED"),
 		windowsNativeToolchain: requiredEnv("CI_DEV_WINDOWS_NATIVE_TOOLCHAIN_RESULT"),
 		windowsNativeToolchainRequired: requiredEnv("CI_DEV_WINDOWS_NATIVE_TOOLCHAIN_REQUIRED"),
 		telegramGuard: requiredEnv("CI_DEV_TELEGRAM_GUARD_RESULT"),
@@ -1680,6 +1709,8 @@ function parseAggregate(value: unknown): AffectedAggregateResults {
 			"windowsDoctorRequired",
 			"windowsNativeToolchain",
 			"windowsNativeToolchainRequired",
+			"windowsAutocompletePath",
+			"windowsAutocompletePathRequired",
 			"telegramGuard",
 			"telegramGuardRequired",
 			"telegramWindows",
@@ -1700,6 +1731,8 @@ function parseAggregate(value: unknown): AffectedAggregateResults {
 		python: value.python as string,
 		windowsDoctor: value.windowsDoctor as string,
 		windowsDoctorRequired: value.windowsDoctorRequired as string,
+		windowsAutocompletePath: value.windowsAutocompletePath as string,
+		windowsAutocompletePathRequired: value.windowsAutocompletePathRequired as string,
 		windowsNativeToolchain: value.windowsNativeToolchain as string,
 		windowsNativeToolchainRequired: value.windowsNativeToolchainRequired as string,
 		telegramGuard: value.telegramGuard as string,
