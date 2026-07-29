@@ -855,11 +855,15 @@ export class CombinedAutocompleteProvider implements AutocompleteProvider {
 
 	#tryAcquireScopedPathAdmission(rawPrefix: string, usesImmediateBoundedEnumeration: boolean): (() => void) | null {
 		const separatorIndex = Math.max(rawPrefix.lastIndexOf("/"), rawPrefix.lastIndexOf("\\"));
-		if (usesImmediateBoundedEnumeration || separatorIndex === -1) {
+		const isDriveRelative = this.#isWindowsDriveRelativePrefix(rawPrefix);
+		if (!isDriveRelative && (usesImmediateBoundedEnumeration || separatorIndex === -1)) {
 			return () => {};
 		}
 
-		const key = rawPrefix.slice(0, separatorIndex + 1);
+		const key =
+			isDriveRelative && separatorIndex < 2
+				? rawPrefix.slice(0, 2).toUpperCase()
+				: rawPrefix.slice(0, separatorIndex + 1);
 		const currentCount = this.#scopedPathAdmissions.get(key);
 		if (currentCount === undefined && this.#scopedPathAdmissions.size >= this.#MAX_BOUNDED_PENDING) {
 			return null;

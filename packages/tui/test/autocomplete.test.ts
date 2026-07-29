@@ -624,6 +624,7 @@ describe("trySyncSlashCompletion", () => {
 describe("unsafe path autocomplete routing", () => {
 	let rootDir: string;
 	let baseDir: string;
+	const actualProcessPlatform = process.platform;
 
 	beforeEach(() => {
 		rootDir = fs.mkdtempSync(path.join(os.tmpdir(), "autocomplete-unsafe-routing-"));
@@ -633,6 +634,11 @@ describe("unsafe path autocomplete routing", () => {
 
 	afterEach(() => {
 		vi.restoreAllMocks();
+		Object.defineProperty(process, "platform", {
+			value: actualProcessPlatform,
+			configurable: true,
+			enumerable: true,
+		});
 		fs.rmSync(rootDir, { recursive: true, force: true });
 	});
 
@@ -1255,6 +1261,58 @@ describe("unsafe path autocomplete routing", () => {
 		const firstResult = await firstRequest;
 		expect(readDirLimitedCalls).toBe(1);
 		expect(firstResult?.items.map(item => item.value)).toEqual(["../outside-0/alpha.ts"]);
+	});
+
+	it("admits one drive-relative scope before canonicalization and shares same-directory enumeration", async () => {
+		const canonicalizationEntered = Promise.withResolvers<void>();
+		const releaseCanonicalization = Promise.withResolvers<void>();
+		let driveRealpathCalls = 0;
+		let readDirLimitedCalls = 0;
+		Object.defineProperty(process, "platform", {
+			value: "win32",
+			configurable: true,
+			enumerable: true,
+		});
+		const gatedRealpath = async (target: fs.PathLike) => {
+			if (String(target).includes("C:scope-")) {
+				driveRealpathCalls += 1;
+				canonicalizationEntered.resolve();
+				await releaseCanonicalization.promise;
+			}
+			return String(target);
+		};
+		vi.spyOn(fs.promises, "realpath").mockImplementation(gatedRealpath as unknown as typeof fs.promises.realpath);
+		vi.spyOn(nativeModule, "readDirLimited").mockImplementation(async () => {
+			readDirLimitedCalls += 1;
+			return makeReadDirLimitedResult([
+				{ name: "alpha.ts", isDirectory: false, isSymbolicLink: false },
+				{ name: "beta.ts", isDirectory: false, isSymbolicLink: false },
+			]);
+		});
+		const provider = new CombinedAutocompleteProvider([], baseDir);
+		const alphaLine = "@C:scope-0\\al";
+		const betaLine = "@C:scope-0\\be";
+		const alphaRequest = provider.getSuggestions([alphaLine], 0, alphaLine.length);
+		const betaRequest = provider.getSuggestions([betaLine], 0, betaLine.length);
+
+		await canonicalizationEntered.promise;
+		await waitForAtLeastNumber(() => driveRealpathCalls, 2);
+		const blockedLine = "@C:scope-1\\al";
+		const blockedResult = await provider.getSuggestions([blockedLine], 0, blockedLine.length);
+		expect(blockedResult).toBeNull();
+		expect(driveRealpathCalls).toBe(2);
+		expect(readDirLimitedCalls).toBe(0);
+
+		releaseCanonicalization.resolve();
+		const [alphaResult, betaResult] = await Promise.all([alphaRequest, betaRequest]);
+		expect(readDirLimitedCalls).toBe(1);
+		expect(alphaResult?.items.map(item => item.value)).toEqual(["@C:scope-0\\alpha.ts"]);
+		expect(betaResult?.items.map(item => item.value)).toEqual(["@C:scope-0\\beta.ts"]);
+
+		const releasedResult = await provider.getSuggestions([blockedLine], 0, blockedLine.length);
+		expect(driveRealpathCalls).toBe(3);
+		expect(readDirLimitedCalls).toBe(2);
+		expect(releasedResult?.items.map(item => item.value)).toEqual(["@C:scope-1\\alpha.ts"]);
 	});
 
 	it("keeps explicit Tab completion exhaustive after natural unsafe suggestions are capped", async () => {
