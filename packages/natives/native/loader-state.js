@@ -421,6 +421,9 @@ export function validateLoadedBindings(ctx, bindings, candidate) {
 	if (typeof bindings.probeWindowsJobMemory !== "function") {
 		throw new Error(`Loaded ${candidate} but it lacks required memory probe capability \`probeWindowsJobMemory\`.`);
 	}
+	if (typeof bindings.readDirLimited !== "function") {
+		throw new Error(`Loaded ${candidate} but it lacks required bounded directory capability \`readDirLimited\`.`);
+	}
 }
 
 function buildHelpMessage(ctx) {

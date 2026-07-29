@@ -7,19 +7,28 @@ describe("memory-guard native build wiring", () => {
 			assertRequiredSymbols("export function nativeBuildInfo(): unknown;", [
 				"nativeBuildInfo",
 				"probeWindowsJobMemory",
+				"readDirLimited",
 			]),
 		).toThrow("probeWindowsJobMemory");
 	});
 
-	it("rejects native addons that omit the Windows memory probe", () => {
+	it("rejects native addons that omit required bounded-directory exports", () => {
 		expect(
-			missingRequiredFunctions({ nativeBuildInfo: () => ({}) }, ["nativeBuildInfo", "probeWindowsJobMemory"]),
-		).toEqual(["probeWindowsJobMemory"]);
-		expect(
-			missingRequiredFunctions({ nativeBuildInfo: () => ({}), probeWindowsJobMemory: () => ({}) }, [
+			missingRequiredFunctions({ nativeBuildInfo: () => ({}) }, [
 				"nativeBuildInfo",
 				"probeWindowsJobMemory",
+				"readDirLimited",
 			]),
+		).toEqual(["probeWindowsJobMemory", "readDirLimited"]);
+		expect(
+			missingRequiredFunctions(
+				{
+					nativeBuildInfo: () => ({}),
+					probeWindowsJobMemory: () => ({}),
+					readDirLimited: () => ({}),
+				},
+				["nativeBuildInfo", "probeWindowsJobMemory", "readDirLimited"],
+			),
 		).toEqual([]);
 	});
 });

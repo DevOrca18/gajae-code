@@ -319,6 +319,19 @@ impl Drop for EntryVisitor<'_> {
 	}
 }
 
+fn resolves_outside_root(path: &Path, canonical_root: &Path) -> bool {
+	std::fs::canonicalize(path).is_ok_and(|target| !target.starts_with(canonical_root))
+}
+
+fn should_collect_stay_within_root_entry(path: &Path, canonical_root: &Path) -> bool {
+	if !resolves_outside_root(path, canonical_root) {
+		return true;
+	}
+	!path
+		.parent()
+		.is_some_and(|parent| resolves_outside_root(parent, canonical_root))
+}
+
 impl ParallelVisitor for EntryVisitor<'_> {
 	fn visit(&mut self, entry: std::result::Result<ignore::DirEntry, ignore::Error>) -> WalkState {
 		if self.visited == 0 || self.visited >= 128 {
@@ -333,15 +346,16 @@ impl ParallelVisitor for EntryVisitor<'_> {
 		let Ok(entry) = entry else {
 			return WalkState::Continue;
 		};
-		let skip_external_symlink = self.canonical_root.is_some_and(|canonical_root| {
-			entry.path_is_symlink()
-				&& !std::fs::canonicalize(entry.path())
-					.is_ok_and(|target| target.starts_with(canonical_root))
+		let skip_external_entry = self
+			.canonical_root
+			.is_some_and(|canonical_root| resolves_outside_root(entry.path(), canonical_root));
+		let should_collect_entry = self.canonical_root.is_none_or(|canonical_root| {
+			should_collect_stay_within_root_entry(entry.path(), canonical_root)
 		});
-		if let Some(entry) = collect_entry(self.root, &entry, self.detail) {
+		if should_collect_entry && let Some(entry) = collect_entry(self.root, &entry, self.detail) {
 			self.entries.push(entry);
 		}
-		if skip_external_symlink {
+		if skip_external_entry {
 			WalkState::Skip
 		} else {
 			WalkState::Continue

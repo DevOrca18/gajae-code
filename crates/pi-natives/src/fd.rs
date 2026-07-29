@@ -52,17 +52,19 @@ fn io_error(err: std::io::Error, context: &str) -> Error {
 	Error::from_reason(format!("{context}: {err}"))
 }
 
-fn consume_limited_results<I, T, E>(
+fn consume_limited_results<I, T, U, E, F>(
 	mut iter: I,
 	limit: usize,
-) -> std::result::Result<(Vec<T>, bool), E>
+	mut convert: F,
+) -> std::result::Result<(Vec<U>, bool), E>
 where
 	I: Iterator<Item = std::result::Result<T, E>>,
+	F: FnMut(T) -> std::result::Result<U, E>,
 {
 	let mut entries = Vec::new();
 	while entries.len() < limit {
 		match iter.next() {
-			Some(Ok(entry)) => entries.push(entry),
+			Some(Ok(entry)) => entries.push(convert(entry)?),
 			Some(Err(err)) => return Err(err),
 			None => return Ok((entries, false)),
 		}
@@ -83,23 +85,22 @@ fn read_dir_limited_sync(options: ReadDirLimitedOptions) -> Result<ReadDirLimite
 
 	let direct_entries = fs::read_dir(&options.path)
 		.map_err(|err| io_error(err, "Failed to read directory"))?
-		.map(|entry| -> Result<ReadDirLimitedEntry> {
-			let entry = entry.map_err(|err| io_error(err, "Failed to read directory entry"))?;
-			let file_type = entry
-				.file_type()
-				.map_err(|err| io_error(err, "Failed to inspect directory entry type"))?;
-			let name = entry.file_name().into_string().map_err(|name| {
-				let name = name.to_string_lossy();
-				Error::from_reason(format!("Directory entry name is not valid UTF-8: {name}"))
-			})?;
-			Ok(ReadDirLimitedEntry {
-				name,
-				is_directory: file_type.is_dir(),
-				is_symbolic_link: file_type.is_symlink(),
-			})
-		});
+		.map(|entry| entry.map_err(|err| io_error(err, "Failed to read directory entry")));
 
-	let (entries, truncated) = consume_limited_results(direct_entries, limit)?;
+	let (entries, truncated) = consume_limited_results(direct_entries, limit, |entry| {
+		let file_type = entry
+			.file_type()
+			.map_err(|err| io_error(err, "Failed to inspect directory entry type"))?;
+		let name = entry
+			.file_name()
+			.into_string()
+			.map_err(|_| Error::from_reason("Directory entry name is not valid UTF-8".to_string()))?;
+		Ok(ReadDirLimitedEntry {
+			name,
+			is_directory: file_type.is_dir(),
+			is_symbolic_link: file_type.is_symlink(),
+		})
+	})?;
 	Ok(ReadDirLimitedResult { entries, truncated })
 }
 
@@ -495,6 +496,28 @@ mod tests {
 	}
 
 	#[test]
+	fn truncates_when_limit_is_one() {
+		let root = TempDir::new("pi-read-dir-limited");
+		for name in ["alpha.txt", "beta.txt"] {
+			fs::write(root.path().join(name), name).expect("write fixture file");
+		}
+
+		let result = read_dir_names(root.path(), 1);
+		assert_eq!(result.entries.len(), 1);
+		assert!(result.truncated);
+	}
+
+	#[test]
+	fn accepts_the_maximum_u32_limit() {
+		let root = TempDir::new("pi-read-dir-limited");
+		fs::write(root.path().join("alpha.txt"), "alpha").expect("write alpha");
+
+		let result = read_dir_names(root.path(), u32::MAX);
+		assert_eq!(result.entries.len(), 1);
+		assert!(!result.truncated);
+	}
+
+	#[test]
 	fn classifies_files_directories_and_symlinks() {
 		let root = TempDir::new("pi-read-dir-limited");
 		let regular = root.path().join("regular.txt");
@@ -538,6 +561,11 @@ mod tests {
 				.to_string()
 				.contains("Failed to read directory")
 		);
+		assert!(
+			!missing_error
+				.to_string()
+				.contains(&missing.to_string_lossy().to_string())
+		);
 
 		let file_error = read_dir_limited_sync(ReadDirLimitedOptions {
 			path:  file.to_string_lossy().into_owned(),
@@ -545,6 +573,11 @@ mod tests {
 		})
 		.expect_err("file path should fail");
 		assert!(file_error.to_string().contains("Failed to read directory"));
+		assert!(
+			!file_error
+				.to_string()
+				.contains(&file.to_string_lossy().to_string())
+		);
 	}
 
 	#[test]
@@ -598,10 +631,43 @@ mod tests {
 		let iterator =
 			CountingIterator { next_value: 0, total: 50, observed: observed.clone() };
 		let (values, truncated) =
-			consume_limited_results(iterator, 3).expect("iterator core should succeed");
+			consume_limited_results(iterator, 3, Ok).expect("iterator core should succeed");
 
 		assert_eq!(values, vec![0, 1, 2]);
 		assert!(truncated);
 		assert_eq!(observed.get(), 4);
+	}
+
+	#[test]
+	fn iterator_core_does_not_convert_the_lookahead_entry() {
+		let values = [Ok::<_, &'static str>("alpha"), Ok("invalid")];
+		let (values, truncated) = consume_limited_results(values.into_iter(), 1, |value| {
+			if value == "invalid" {
+				return Err("lookahead should not be converted");
+			}
+			Ok(value)
+		})
+		.expect("lookahead should only detect truncation");
+
+		assert_eq!(values, vec!["alpha"]);
+		assert!(truncated);
+	}
+
+	#[cfg(all(unix, not(target_os = "macos")))]
+	#[test]
+	fn invalid_utf8_entry_uses_a_fixed_error_message() {
+		use std::os::unix::ffi::OsStringExt;
+
+		let root = TempDir::new("pi-read-dir-limited");
+		let invalid_name = std::ffi::OsString::from_vec(vec![0xff, b'.', b't', b's']);
+		fs::File::create(root.path().join(invalid_name)).expect("create invalid utf8 entry");
+
+		let err = read_dir_limited_sync(ReadDirLimitedOptions {
+			path:  root.path().to_string_lossy().into_owned(),
+			limit: 1,
+		})
+		.expect_err("invalid utf8 entry should fail");
+
+		assert_eq!(err.to_string(), "Directory entry name is not valid UTF-8");
 	}
 }

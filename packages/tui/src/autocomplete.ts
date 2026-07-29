@@ -660,6 +660,7 @@ export class CombinedAutocompleteProvider implements AutocompleteProvider {
 		if (
 			pathPrefix.includes("/") ||
 			pathPrefix.includes("\\") ||
+			this.#isWindowsDriveRelativePrefix(pathPrefix) ||
 			pathPrefix.startsWith(".") ||
 			pathPrefix.startsWith("~/") ||
 			pathPrefix.startsWith("~\\")
@@ -680,6 +681,19 @@ export class CombinedAutocompleteProvider implements AutocompleteProvider {
 		return /^[A-Za-z]:([\\/]|$)/.test(prefix);
 	}
 
+	#isWindowsDriveLikePrefix(prefix: string): boolean {
+		return /^[A-Za-z]:/.test(prefix);
+	}
+
+	#isWindowsDriveRelativePrefix(prefix: string): boolean {
+		return /^[A-Za-z]:[^\\/]*$/.test(prefix);
+	}
+
+	#isTerminalParentPathPrefix(prefix: string): boolean {
+		const normalized = prefix.replace(/[\\/]+$/, "");
+		return normalized === ".." || /(?:^|[\\/])\.\.$/.test(normalized);
+	}
+
 	#isWindowsUncPrefix(prefix: string): boolean {
 		return /^\\\\[^\\]/.test(prefix) || /^\/\/[^/]/.test(prefix);
 	}
@@ -696,7 +710,11 @@ export class CombinedAutocompleteProvider implements AutocompleteProvider {
 	}
 
 	#isImmediatelyUnsafeAutomaticPrefix(prefix: string): boolean {
-		return this.#isAbsoluteOrHomePrefix(prefix);
+		return (
+			this.#isAbsoluteOrHomePrefix(prefix) ||
+			this.#isWindowsDriveRelativePrefix(prefix) ||
+			this.#isTerminalParentPathPrefix(prefix)
+		);
 	}
 
 	// Expand home directory (~/) to actual home path
@@ -1003,8 +1021,12 @@ export class CombinedAutocompleteProvider implements AutocompleteProvider {
 			return displayPrefix + name;
 		}
 
-		if (options?.preserveLiteralDir && /^[A-Za-z]:$/.test(displayPrefix)) {
-			return displayPrefix + name;
+		if (options?.preserveLiteralDir && this.#isTerminalParentPathPrefix(displayPrefix)) {
+			return `${displayPrefix}${this.#directorySuffixForPrefix(displayPrefix)}${name}`;
+		}
+
+		if (options?.preserveLiteralDir && /^[A-Za-z]:[^\\/]*$/.test(displayPrefix)) {
+			return `${displayPrefix.slice(0, 2)}${name}`;
 		}
 
 		if (/[\\/]/.test(displayPrefix)) {
@@ -1053,7 +1075,7 @@ export class CombinedAutocompleteProvider implements AutocompleteProvider {
 		if (
 			lastBackslashIndex !== -1 ||
 			displayPrefix.startsWith("~\\") ||
-			this.#isWindowsDrivePrefix(displayPrefix) ||
+			this.#isWindowsDriveLikePrefix(displayPrefix) ||
 			this.#isWindowsUncPrefix(displayPrefix)
 		) {
 			return "\\";
@@ -1063,7 +1085,8 @@ export class CombinedAutocompleteProvider implements AutocompleteProvider {
 
 	#dirnameForPrefix(filePath: string): string {
 		const lastSeparatorIndex = Math.max(filePath.lastIndexOf("/"), filePath.lastIndexOf("\\"));
-		const pathFlavor = this.#isWindowsDrivePrefix(filePath) || this.#isWindowsUncPrefix(filePath) ? path.win32 : path;
+		const pathFlavor =
+			this.#isWindowsDriveLikePrefix(filePath) || this.#isWindowsUncPrefix(filePath) ? path.win32 : path;
 		const root = pathFlavor.parse(filePath).root;
 		if (lastSeparatorIndex === -1 || filePath.length <= root.length) {
 			return root || ".";
@@ -1076,12 +1099,16 @@ export class CombinedAutocompleteProvider implements AutocompleteProvider {
 
 	#basenameForPrefix(filePath: string): string {
 		const lastSeparatorIndex = Math.max(filePath.lastIndexOf("/"), filePath.lastIndexOf("\\"));
-		const pathFlavor = this.#isWindowsDrivePrefix(filePath) || this.#isWindowsUncPrefix(filePath) ? path.win32 : path;
+		const pathFlavor =
+			this.#isWindowsDriveLikePrefix(filePath) || this.#isWindowsUncPrefix(filePath) ? path.win32 : path;
 		const root = pathFlavor.parse(filePath).root;
 		if (filePath.length <= root.length) {
 			return "";
 		}
-		return lastSeparatorIndex === -1 ? filePath : filePath.slice(lastSeparatorIndex + 1);
+		if (lastSeparatorIndex === -1) {
+			return root.length > 0 ? filePath.slice(root.length) : filePath;
+		}
+		return filePath.slice(lastSeparatorIndex + 1);
 	}
 
 	// Get file/directory suggestions for a given path prefix
@@ -1116,6 +1143,7 @@ export class CombinedAutocompleteProvider implements AutocompleteProvider {
 				rawPrefix === "" ||
 				rawPrefix === "./" ||
 				rawPrefix === "../" ||
+				this.#isTerminalParentPathPrefix(rawPrefix) ||
 				rawPrefix === "~" ||
 				rawPrefix === "~/" ||
 				rawPrefix === "~\\" ||
@@ -1124,7 +1152,7 @@ export class CombinedAutocompleteProvider implements AutocompleteProvider {
 
 			if (isRootPrefix) {
 				// Complete from specified position
-				if (rawPrefix.startsWith("~") || isExpandedAbsolute) {
+				if (rawPrefix.startsWith("~") || isExpandedAbsolute || this.#isWindowsDriveRelativePrefix(rawPrefix)) {
 					searchDir = expandedPrefix;
 				} else {
 					searchDir = relativeSearchDirFor(expandedPrefix);
@@ -1132,7 +1160,7 @@ export class CombinedAutocompleteProvider implements AutocompleteProvider {
 				searchPrefix = "";
 			} else if (/[\\/]$/.test(rawPrefix)) {
 				// If prefix ends with /, show contents of that directory
-				if (rawPrefix.startsWith("~") || isExpandedAbsolute) {
+				if (rawPrefix.startsWith("~") || isExpandedAbsolute || this.#isWindowsDriveRelativePrefix(rawPrefix)) {
 					searchDir = expandedPrefix;
 				} else {
 					searchDir = relativeSearchDirFor(expandedPrefix);
@@ -1142,7 +1170,7 @@ export class CombinedAutocompleteProvider implements AutocompleteProvider {
 				// Split into directory and file prefix
 				const dir = this.#dirnameForPrefix(expandedPrefix);
 				const file = this.#basenameForPrefix(expandedPrefix);
-				if (rawPrefix.startsWith("~") || isExpandedAbsolute) {
+				if (rawPrefix.startsWith("~") || isExpandedAbsolute || this.#isWindowsDriveRelativePrefix(rawPrefix)) {
 					searchDir = dir;
 				} else {
 					searchDir = relativeSearchDirFor(dir);
@@ -1268,7 +1296,9 @@ export class CombinedAutocompleteProvider implements AutocompleteProvider {
 					? this.#scopedPathForDisplay(resolvedScopedQuery.displayBase, pathWithoutSlash)
 					: pathWithoutSlash;
 				const entryName = path.basename(pathWithoutSlash);
-				const completionPath = isDirectory ? `${displayPath}/` : displayPath;
+				const completionPath = isDirectory
+					? `${displayPath}${this.#directorySuffixForPrefix(displayPath)}`
+					: displayPath;
 				const value = buildCompletionValue(completionPath, {
 					isDirectory,
 					isAtPrefix: true,
